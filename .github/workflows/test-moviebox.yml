@@ -41,8 +41,11 @@ jobs:
           python scripts/check_mp4_url.py "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/720/Big_Buck_Bunny_720_10s_1MB.mp4"
 
       - name: Check authorized media URL, if configured
-        if: ${{ secrets.MEDIA_TEST_URL != '' }}
         env:
           MEDIA_TEST_URL: ${{ secrets.MEDIA_TEST_URL }}
         run: |
-          python scripts/check_mp4_url.py "$MEDIA_TEST_URL"
+          if [ -z "$MEDIA_TEST_URL" ]; then
+            echo "SKIPPED: Add MEDIA_TEST_URL as a GitHub Actions secret to inspect your own/authorized media URL."
+          else
+            python scripts/check_mp4_url.py "$MEDIA_TEST_URL"
+          fi
