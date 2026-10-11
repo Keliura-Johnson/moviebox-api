@@ -30,9 +30,8 @@ jobs:
           pip install -e ".[cli]" httpx
 
       - name: Test MovieBox title resolution
-        if: github.event_name == 'workflow_dispatch'
         env:
-          MOVIE_TITLE: ${{ inputs.title }}
+          MOVIE_TITLE: ${{ inputs.title || 'Avatar' }}
         run: |
           moviebox v3 download-movie "$MOVIE_TITLE" --test --yes
 
