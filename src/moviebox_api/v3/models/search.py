@@ -72,6 +72,7 @@ class ResultsSubjectModel(BaseModel):
     related_app: Any = Field(alias="relatedApp")
     restrict_level: str = Field(alias="restrictLevel")
     corner: str
+    corner_badge: Any = Field(default=None, alias="cornerBadge")
     like_status: int = Field(alias="likeStatus")
     style: Any
     detail_url: HttpUrl | None = Field(alias="detailUrl")
