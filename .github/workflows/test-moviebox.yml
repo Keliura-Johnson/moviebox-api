@@ -1,13 +1,16 @@
-
-name: Test MovieBox API
+name: Test MovieBox API and MP4 detection
 
 on:
   workflow_dispatch:
     inputs:
       title:
-        description: Movie or series title to test
+        description: Movie or series title to test in the MovieBox CLI
         required: true
         default: Avatar
+  push:
+    paths:
+      - "scripts/check_mp4_url.py"
+      - ".github/workflows/test-moviebox.yml"
 
 jobs:
   test:
@@ -24,8 +27,22 @@ jobs:
       - name: Install MovieBox API
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[cli]"
+          pip install -e ".[cli]" httpx
 
-      - name: Test movie availability
+      - name: Test MovieBox title resolution
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          MOVIE_TITLE: ${{ inputs.title }}
         run: |
-          moviebox v3 download-movie "${{ inputs.title }}" --test --yes
+          moviebox v3 download-movie "$MOVIE_TITLE" --test --yes
+
+      - name: Verify MP4 detector using a public sample clip
+        run: |
+          python scripts/check_mp4_url.py "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/720/Big_Buck_Bunny_720_10s_1MB.mp4"
+
+      - name: Check authorized media URL, if configured
+        if: ${{ secrets.MEDIA_TEST_URL != '' }}
+        env:
+          MEDIA_TEST_URL: ${{ secrets.MEDIA_TEST_URL }}
+        run: |
+          python scripts/check_mp4_url.py "$MEDIA_TEST_URL"
