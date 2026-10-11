@@ -3,6 +3,7 @@ from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 APP_VERSION = "1.0.0"
@@ -42,9 +43,11 @@ async def root():
         "health": "/health",
         "docs": "/docs",
         "media_inspector": "/api/v1/media/inspect",
+        "demo_player": "/watch/demo",
         "note": (
             "The media inspector only checks HTTPS hosts listed in "
-            "MEDIA_ALLOWED_HOSTS. It does not resolve or provide movie streams."
+            "MEDIA_ALLOWED_HOSTS. /watch/demo is a licensed public sample player; "
+            "it does not resolve third-party movie streams."
         ),
     }
 
@@ -137,3 +140,42 @@ async def inspect_media(
             status_code=502,
             detail=f"Media host request failed: {type(exc).__name__}.",
         ) from exc
+
+
+@app.get("/watch/demo", response_class=HTMLResponse, tags=["playback"])
+async def demo_player():
+    """Browser player for the openly available Big Buck Bunny sample clip."""
+    video_url = (
+        "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/720/"
+        "Big_Buck_Bunny_720_10s_1MB.mp4"
+    )
+    return HTMLResponse(
+        content=f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MovieBox API — Playback Test</title>
+  <style>
+    body {{ margin: 0; padding: 24px; background: #0b0712; color: #fff;
+           font: 16px system-ui, sans-serif; }}
+    main {{ max-width: 960px; margin: 0 auto; }}
+    video {{ display: block; width: 100%; max-height: 75vh; background: #000;
+             border-radius: 12px; }}
+    p {{ color: #c8bfd8; line-height: 1.5; }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Playback test</h1>
+    <p>Big Buck Bunny — a freely available sample clip used to verify browser playback.</p>
+    <video controls playsinline preload="metadata">
+      <source src="{video_url}" type="video/mp4">
+      Your browser does not support HTML video playback.
+    </video>
+    <p>If the video plays here, your Render deployment can serve a player page. This is a sample clip, not a MovieBox catalogue stream.</p>
+  </main>
+</body>
+</html>""",
+        headers={"Cache-Control": "no-store"},
+    )
