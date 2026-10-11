@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: moviebox-api-web
+    runtime: python
+    plan: free
+    branch: feature/browser-api
+    buildCommand: pip install -e .
+    startCommand: uvicorn api:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: MEDIA_ALLOWED_HOSTS
+        value: test-videos.co.uk
