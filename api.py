@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 APP_VERSION = "1.0.0"
 DEFAULT_ALLOWED_HOSTS = {"test-videos.co.uk"}
+
 ALLOWED_MEDIA_HOSTS = {
     host.strip().lower()
     for host in os.getenv(
@@ -297,8 +298,12 @@ def get_option_resolution(option):
 def get_movie_options(details):
     return [
         option
-        for detector in (getattr(details, "resource_detectors", None) or [])
-        for option in (getattr(detector, "resolution_list", None) or [])
+        for detector in (
+            getattr(details, "resource_detectors", None) or []
+        )
+        for option in (
+            getattr(detector, "resolution_list", None) or []
+        )
         if getattr(option, "resource_link", None)
     ]
 
@@ -310,98 +315,82 @@ async def get_episode_resources(
     episode,
     requested_resolution=None,
 ):
-    """Fetch resources for one specific series episode."""
-    from moviebox_api.v3.urls import RESOURCE_PATH
-    from moviebox_api.v3.models.downloadables import (
-        RootDownloadableFilesDetailModel,
-    )
+    """Return direct resource links for one specific TV episode."""
+    from moviebox_api.v3.core import ItemDetails
 
     if season < 1 or episode < 1:
         raise HTTPException(
             400, "Season and episode must be positive numbers."
         )
 
-    qualities = [360, 480, 720, 1080]
+    # Use the same MovieBox detail-resource pipeline as movie downloads.
+    details = await ItemDetails(
+        client_session=client
+    ).get_content_model(str(subject_id))
+
     found = []
 
-    for quality in qualities:
-        for page in range(1, 11):
-            params = {
-                "subjectId": str(subject_id),
-                "se": int(season),
-                "ep": int(episode),
-                "resolution": quality,
-                "page": page,
-                "perPage": 20,
-            }
+    detectors = list(
+        getattr(details, "resource_detectors", None) or []
+    )
 
+    for detector in detectors:
+        entries = list(
+            getattr(detector, "resolution_list", None) or []
+        )
+
+        for entry in entries:
+            # Match the exact requested episode using MovieBox's
+            # season ("se") and episode ("ep") fields.
             try:
-                raw = await client.get_from_api(
-                    RESOURCE_PATH,
-                    params=params,
+                entry_season = int(
+                    getattr(entry, "se", 0) or 0
                 )
-                metadata = RootDownloadableFilesDetailModel.model_validate(
-                    raw
+                entry_episode = int(
+                    getattr(entry, "ep", 0) or 0
                 )
-                entries = list(getattr(metadata, "list", []) or [])
-            except Exception:
-                break
-
-            for entry in entries:
-                try:
-                    entry_season = int(
-                        getattr(entry, "season", 0) or 0
-                    )
-                    entry_episode = int(
-                        getattr(entry, "episode", 0) or 0
-                    )
-                except (TypeError, ValueError):
-                    continue
-
-                if (
-                    entry_season != int(season)
-                    or entry_episode != int(episode)
-                ):
-                    continue
-
-                resource_link = getattr(entry, "resource_link", None)
-
-                if not resource_link:
-                    continue
-
-                url = str(resource_link)
-                parsed = urlparse(url)
-
-                if parsed.scheme != "https" or not parsed.hostname:
-                    continue
-
-                if is_placeholder_resource(entry) or is_placeholder_resource(url):
-                    continue
-
-                actual_resolution = (
-                    get_option_resolution(entry) or quality
-                )
-
-                if actual_resolution <= 0:
-                    continue
-
-                found.append({
-                    "resolution": actual_resolution,
-                    "size": getattr(entry, "size", None),
-                    "resource_link": url,
-                    "title": getattr(entry, "title", None),
-                    "season": entry_season,
-                    "episode": entry_episode,
-                })
-
-            pager = getattr(metadata, "pager", None)
+            except (TypeError, ValueError):
+                continue
 
             if (
-                not bool(getattr(pager, "has_more", False))
-                or not entries
+                entry_season != int(season)
+                or entry_episode != int(episode)
             ):
-                break
+                continue
 
+            resource_link = getattr(entry, "resource_link", None)
+
+            if not resource_link:
+                continue
+
+            url = str(resource_link)
+            parsed = urlparse(url)
+
+            if parsed.scheme != "https" or not parsed.hostname:
+                continue
+
+            # Reject the known placeholder file.
+            if (
+                is_placeholder_resource(entry)
+                or is_placeholder_resource(url)
+            ):
+                continue
+
+            actual_resolution = get_option_resolution(entry)
+
+            if actual_resolution <= 0:
+                continue
+
+            found.append({
+                "resolution": actual_resolution,
+                "size": getattr(entry, "size", None),
+                "resource_link": url,
+                "title": getattr(entry, "title", None),
+                "season": entry_season,
+                "episode": entry_episode,
+            })
+
+    # Remove duplicate quality/URL combinations.
     unique = {}
 
     for resource in found:
@@ -413,7 +402,10 @@ async def get_episode_resources(
         )
         unique[key] = resource
 
-    return list(unique.values())
+    resources = list(unique.values())
+    resources.sort(key=lambda resource: resource["resolution"])
+
+    return resources
 
 
 @app.get("/api/v1/download/qualities")
@@ -437,10 +429,7 @@ async def get_download_qualities(
 
             if media_type == "tv":
                 resources = await get_episode_resources(
-                    client,
-                    item.subject_id,
-                    season,
-                    episode,
+                    client, item.subject_id, season, episode
                 )
 
                 qualities = sorted({
@@ -527,6 +516,7 @@ async def resolve_download(
                     item.subject_id,
                     season,
                     episode,
+                    requested_resolution=resolution,
                 )
 
                 if not resources:
@@ -546,6 +536,7 @@ async def resolve_download(
                 ]
 
                 chosen = eligible[-1] if eligible else resources[0]
+                url = chosen["resource_link"]
 
                 return {
                     "result": "ok",
@@ -558,14 +549,14 @@ async def resolve_download(
                     "episode": episode,
                     "resolution": chosen["resolution"],
                     "size_bytes": chosen.get("size"),
-                    "download_url": chosen["resource_link"],
+                    "download_url": url,
                     "url_expires_note": (
                         "Start downloading promptly; "
                         "the source URL may expire."
                     ),
                 }
 
-            # Movie resolution remains on its existing path.
+            # Existing movie resolution logic is unchanged.
             details = await ItemDetails(
                 client_session=client
             ).get_content_model(item.subject_id)
@@ -635,9 +626,7 @@ async def diagnose_moviebox_download():
 
         async with session._client:
             results = await Search(
-                session=session,
-                query="Sintel",
-                per_page=10,
+                session=session, query="Sintel", per_page=10
             ).get_content_model()
 
             candidates = [
@@ -646,16 +635,12 @@ async def diagnose_moviebox_download():
             ]
 
             if not candidates:
-                return {
-                    "stage": "search",
-                    "result": "no_match",
-                }
+                return {"stage": "search", "result": "no_match"}
 
             item = candidates[0]
 
             raw = await DownloadableMovieFilesDetail(
-                session=session,
-                item=item,
+                session=session, item=item
             ).get_content()
 
             downloads = [
@@ -672,8 +657,7 @@ async def diagnose_moviebox_download():
             checks = []
 
             async with httpx.AsyncClient(
-                follow_redirects=True,
-                timeout=20,
+                follow_redirects=True, timeout=20
             ) as client:
                 for media in metadata.downloads:
                     try:
@@ -744,9 +728,7 @@ async def diagnose_moviebox_v3_download():
 
         async with MovieBoxHttpClient(timeout=25) as client:
             item = await find_moviebox_item(
-                client,
-                "Sintel",
-                media_type="movie",
+                client, "Sintel", media_type="movie"
             )
 
             details = await ItemDetails(
@@ -756,8 +738,7 @@ async def diagnose_moviebox_v3_download():
             checks = []
 
             async with httpx.AsyncClient(
-                follow_redirects=True,
-                timeout=25,
+                follow_redirects=True, timeout=25
             ) as media_client:
                 for option in get_movie_options(details):
                     url = str(option.resource_link)
@@ -818,9 +799,7 @@ async def diagnose_sintel_full_download():
 
         async with MovieBoxHttpClient(timeout=30) as client:
             item = await find_moviebox_item(
-                client,
-                "Sintel",
-                media_type="movie",
+                client, "Sintel", media_type="movie"
             )
 
             details = await ItemDetails(
@@ -847,10 +826,7 @@ async def diagnose_sintel_full_download():
             async with httpx.AsyncClient(
                 follow_redirects=True,
                 timeout=httpx.Timeout(
-                    connect=15,
-                    read=45,
-                    write=15,
-                    pool=15,
+                    connect=15, read=45, write=15, pool=15
                 ),
             ) as media:
                 async with media.stream(
@@ -886,8 +862,7 @@ async def diagnose_sintel_full_download():
                             }
 
             valid_mp4 = (
-                len(prefix) >= 8
-                and prefix[4:8] == b"ftyp"
+                len(prefix) >= 8 and prefix[4:8] == b"ftyp"
             )
 
             expected = (
