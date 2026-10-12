@@ -359,9 +359,11 @@ async def diagnose_moviebox_download():
 
 @app.get("/api/v1/diagnostics/moviebox-v3-download", tags=["diagnostics"])
 async def diagnose_moviebox_v3_download():
-    """Compare both v3 media URL fields and validate actual byte-range size."""
+    """Tests each requested resolution and checks the resulting CDN object size."""
     import sys
     from pathlib import Path
+    import hashlib
+    from moviebox_api.v3.constants import ResolutionType
 
     source_dir = str(Path(__file__).resolve().parent / "src")
     if source_dir not in sys.path:
@@ -370,7 +372,6 @@ async def diagnose_moviebox_v3_download():
     try:
         from moviebox_api.v3.http_client import MovieBoxHttpClient
         from moviebox_api.v3.core import Search, DownloadableVideoFilesDetail
-        from moviebox_api.v3.constants import CustomResolutionType
 
         async with MovieBoxHttpClient(timeout=25.0) as client:
             search = Search(client_session=client, query="Sintel", per_page=10)
@@ -390,39 +391,30 @@ async def diagnose_moviebox_v3_download():
                 }
 
             item = candidates[0]
-            downloader = DownloadableVideoFilesDetail(
-                client_session=client,
-                per_page=10,
-                resolution=CustomResolutionType.BEST,
-            )
-            metadata = await downloader.get_content_model(
-                subject_id=item.subject_id,
-                release_date=str(item.release_date),
-            )
-            if not metadata.list:
-                return {
-                    "stage": "v3_resource_metadata",
-                    "result": "no_downloads",
-                    "title": item.title,
-                    "subject_id": item.subject_id,
-                }
-
-            checks = []
+            all_checks = []
             async with httpx.AsyncClient(follow_redirects=True, timeout=25.0) as media_client:
-                for media in metadata.list[:6]:
-                    for url_field, media_url in (
-                        ("resourceLink", str(media.resource_link)),
-                        ("sourceUrl", str(media.source_url)),
-                    ):
+                for resolution in (ResolutionType._360P, ResolutionType._720P, ResolutionType._1080P):
+                    downloader = DownloadableVideoFilesDetail(
+                        client_session=client,
+                        per_page=10,
+                        resolution=resolution,
+                    )
+                    metadata = await downloader.get_content_model(
+                        subject_id=item.subject_id,
+                        release_date=str(item.release_date),
+                    )
+                    option_checks = []
+                    for media in metadata.list[:4]:
+                        media_url = str(media.resource_link)
                         parsed = urlparse(media_url)
-                        if parsed.scheme != "https" or not parsed.hostname:
-                            checks.append({
-                                "resolution": media.resolution,
-                                "url_field": url_field,
-                                "result": "invalid_url",
-                            })
-                            continue
-
+                        url_fingerprint = hashlib.sha256(media_url.encode()).hexdigest()[:12]
+                        check = {
+                            "requested_resolution": int(resolution),
+                            "returned_resolution": media.resolution,
+                            "declared_size_bytes": media.size,
+                            "url_fingerprint": url_fingerprint,
+                            "url_host": parsed.hostname,
+                        }
                         try:
                             async with media_client.stream(
                                 "GET",
@@ -433,13 +425,11 @@ async def diagnose_moviebox_v3_download():
                                         "en_US; 23078RKD5C; Build/TQ2A.230405.003; Cronet/135.0.7012.3)"
                                     ),
                                     "Accept": "video/mp4,video/*;q=0.9,*/*;q=0.8",
-                                    "Range": "bytes=0-63",
+                                    "Range": "bytes=0-1023",
                                 },
                             ) as response:
                                 sample = await response.aread()
-                                content_type = response.headers.get(
-                                    "content-type", "unknown"
-                                ).split(";")[0].lower()
+                                content_type = response.headers.get("content-type", "unknown").split(";")[0].lower()
                                 content_range = response.headers.get("content-range", "")
                                 total_size = None
                                 if "/" in content_range:
@@ -448,60 +438,41 @@ async def diagnose_moviebox_v3_download():
                                     except ValueError:
                                         pass
                                 has_ftyp = len(sample) >= 8 and sample[4:8] == b"ftyp"
-                                looks_like_mp4 = (
-                                    response.status_code in (200, 206)
-                                    and content_type == "video/mp4"
-                                    and has_ftyp
-                                )
                                 size_matches = (
                                     total_size is not None
                                     and abs(total_size - media.size) <= max(1024 * 1024, int(media.size * 0.02))
                                 )
-                                checks.append({
-                                    "resolution": media.resolution,
-                                    "url_field": url_field,
-                                    "declared_size_bytes": media.size,
-                                    "actual_total_bytes_from_range": total_size,
-                                    "size_matches_metadata": size_matches,
-                                    "cdn_host": urlparse(str(response.url)).hostname,
+                                check.update({
+                                    "final_cdn_host": urlparse(str(response.url)).hostname,
                                     "http_status": response.status_code,
                                     "content_type": content_type,
                                     "content_range": content_range or None,
                                     "sample_bytes": len(sample),
                                     "mp4_ftyp_signature": has_ftyp,
-                                    "looks_like_mp4": looks_like_mp4,
-                                    "result": (
-                                        "pass" if looks_like_mp4 and size_matches else "fail"
-                                    ),
-                                    "note": (
-                                        None if size_matches else
-                                        "MP4 signature alone is insufficient: returned file size differs from API metadata."
-                                    ),
+                                    "actual_total_bytes": total_size,
+                                    "size_matches_metadata": size_matches,
+                                    "result": "pass" if response.status_code in (200, 206) and content_type == "video/mp4" and has_ftyp and size_matches else "fail",
                                 })
-                        except Exception as check_error:
-                            checks.append({
-                                "resolution": media.resolution,
-                                "url_field": url_field,
-                                "result": "error",
-                                "error_type": type(check_error).__name__,
-                                "message": str(check_error)[:180],
-                            })
+                        except Exception as exc:
+                            check.update({"result": "error", "error_type": type(exc).__name__, "message": str(exc)[:180]})
+                        option_checks.append(check)
+                    all_checks.append({
+                        "requested_resolution": int(resolution),
+                        "resource_options_returned": len(metadata.list),
+                        "options": option_checks,
+                    })
 
-            passed = any(check.get("result") == "pass" for check in checks)
+            passed = any(
+                option.get("result") == "pass"
+                for group in all_checks for option in group["options"]
+            )
             return {
-                "stage": "v3_cdn_full_resource_validation",
+                "stage": "v3_resolution_selection",
                 "result": "pass" if passed else "fail",
-                "api_version": "v3_signed_native",
                 "title": item.title,
                 "subject_id": item.subject_id,
-                "resource_options_found": len(metadata.list),
-                "checks_run": len(checks),
-                "checks": checks,
-                "message": (
-                    "At least one URL returned MP4 bytes with a total size consistent with metadata."
-                    if passed else
-                    "No URL has yet passed both the MP4 signature and metadata-size checks. Compare resourceLink and sourceUrl results."
-                ),
+                "resolution_tests": all_checks,
+                "message": "Found at least one MP4 whose actual size matches its metadata." if passed else "No selected resolution passed the full MP4 size check. Compare URL fingerprints and returned resolutions to diagnose selection behavior.",
             }
     except Exception as exc:
         return {
