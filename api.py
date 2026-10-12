@@ -140,6 +140,37 @@ def setup_source_path():
         sys.path.insert(0, source_dir)
 
 
+def is_placeholder_resource(resource):
+    if isinstance(resource, str):
+        url = resource
+    elif isinstance(resource, dict):
+        url = (
+            resource.get("resource_link")
+            or resource.get("resourceLink")
+            or resource.get("url")
+            or ""
+        )
+    else:
+        url = (
+            getattr(resource, "resource_link", None)
+            or getattr(resource, "resourceLink", None)
+            or getattr(resource, "url", None)
+            or ""
+        )
+
+    try:
+        parsed = urlparse(str(url))
+        filename = parsed.path.rsplit("/", 1)[-1].lower()
+
+        return (
+            (parsed.hostname or "").lower() == "macdn.aoneroom.com"
+            and filename.startswith("b164fbfb43477929")
+            and filename.endswith(".mp4")
+        )
+    except (TypeError, ValueError):
+        return False
+
+
 def normalize_title(value):
     return "".join(
         character.lower()
@@ -193,14 +224,11 @@ async def find_moviebox_item(
     all_items = list(getattr(results, "items", []) or [])
     target_type = 2 if media_type == "tv" else 1
 
-    # Do not let a movie result satisfy a TV-series request, or vice versa.
     typed_items = [
         item for item in all_items
         if get_subject_type(item) == target_type
     ]
 
-    # Some package versions may not expose subject type on search results.
-    # In that case, fail safely for TV rather than choosing an unverified item.
     if not typed_items:
         if media_type == "tv":
             raise HTTPException(
@@ -209,7 +237,6 @@ async def find_moviebox_item(
                 "MovieBox did not return a result identifiable as a TV series.",
             )
 
-        # Preserve movie lookup compatibility if the API version omits type.
         typed_items = [
             item for item in all_items
             if getattr(item, "has_resource", False)
@@ -242,7 +269,6 @@ async def find_moviebox_item(
 
     items.sort(key=score, reverse=True)
 
-    # Reject clearly unrelated search matches.
     best = items[0]
     best_title = normalize_title(getattr(best, "title", ""))
 
@@ -289,7 +315,9 @@ async def get_episode_resources(
     from moviebox_api.v3.constants import CustomResolutionType
 
     if season < 1 or episode < 1:
-        raise HTTPException(400, "Season and episode must be positive numbers.")
+        raise HTTPException(
+            400, "Season and episode must be positive numbers."
+        )
 
     qualities = (
         [int(requested_resolution)]
@@ -307,7 +335,6 @@ async def get_episode_resources(
             lookup_errors.append(type(exc).__name__)
             continue
 
-        # Pagination belongs in the constructor for the v3 API.
         for page in range(1, 11):
             try:
                 downloader = DownloadableVideoFilesDetail(
@@ -334,8 +361,6 @@ async def get_episode_resources(
                 except (TypeError, ValueError):
                     continue
 
-                # Exact episode matching only; never use the first available
-                # resource as a substitute for the requested episode.
                 if (
                     entry_season != season
                     or entry_episode != episode
@@ -351,6 +376,11 @@ async def get_episode_resources(
                 parsed = urlparse(url)
 
                 if parsed.scheme != "https" or not parsed.hostname:
+                    continue
+
+                # This is the important fix: reject MovieBox's known
+                # placeholder/ad file before adding it to the download list.
+                if is_placeholder_resource(entry) or is_placeholder_resource(url):
                     continue
 
                 found.append({
@@ -503,8 +533,6 @@ async def resolve_download(
                         f"at {resolution}p.",
                     )
 
-                # All resources here have already been matched to the
-                # requested season and episode.
                 resources.sort(key=lambda resource: resource["resolution"])
 
                 eligible = [
@@ -530,7 +558,7 @@ async def resolve_download(
                     ),
                 }
 
-            # Movie resolution is intentionally kept on the existing path.
+            # Movie resolution remains on its existing path.
             details = await ItemDetails(
                 client_session=client
             ).get_content_model(item.subject_id)
@@ -689,7 +717,9 @@ async def diagnose_moviebox_v3_download():
         from moviebox_api.v3.core import ItemDetails
 
         async with MovieBoxHttpClient(timeout=25) as client:
-            item = await find_moviebox_item(client, "Sintel", media_type="movie")
+            item = await find_moviebox_item(
+                client, "Sintel", media_type="movie"
+            )
             details = await ItemDetails(
                 client_session=client
             ).get_content_model(item.subject_id)
