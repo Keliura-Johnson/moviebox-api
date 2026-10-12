@@ -274,6 +274,23 @@ async def diagnose_moviebox_download():
                                 content_type == "video/mp4" and sample[:1] != b"<"
                             )
                             passed = response.status_code in (200, 206) and is_mp4
+                            # Return safe diagnostics for blocked responses so we can
+                            # distinguish rate limits from an invalid/expired media URL.
+                            diagnostic_headers = {
+                                key: response.headers.get(key)
+                                for key in (
+                                    "retry-after", "server", "via",
+                                    "content-length", "content-type",
+                                    "location", "cf-ray"
+                                )
+                                if response.headers.get(key) is not None
+                            }
+                            body_preview = ""
+                            if not passed:
+                                body_preview = sample[:400].decode(
+                                    "utf-8", errors="replace"
+                                )
+                                body_preview = " ".join(body_preview.split())[:400]
                             checks.append({
                                 "resolution": media.resolution,
                                 "extension": media.ext,
@@ -281,6 +298,8 @@ async def diagnose_moviebox_download():
                                 "http_status": response.status_code,
                                 "final_host": urlparse(str(response.url)).hostname,
                                 "content_type": content_type,
+                                "response_headers": diagnostic_headers,
+                                "error_body_preview": body_preview or None,
                                 "sample_bytes": len(sample),
                                 "mp4_ftyp_signature": has_ftyp,
                                 "looks_like_mp4": is_mp4,
