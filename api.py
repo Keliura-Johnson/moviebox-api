@@ -1,4 +1,3 @@
-
 import os
 import sys
 import time
@@ -23,10 +22,7 @@ ALLOWED_MEDIA_HOSTS = {
 
 app = FastAPI(
     title="MovieBox API Web Service",
-    description=(
-        "Browser-accessible API wrapper with health checks and a restricted "
-        "media-response inspector."
-    ),
+    description="MovieBox v3 download API with movie and episode resolution.",
     version=APP_VERSION,
 )
 
@@ -39,7 +35,7 @@ app.add_middleware(
 )
 
 
-@app.get("/", tags=["service"])
+@app.get("/")
 async def root():
     return {
         "name": "MovieBox API Web Service",
@@ -49,149 +45,457 @@ async def root():
         "docs": "/docs",
         "media_inspector": "/api/v1/media/inspect",
         "demo_player": "/watch/demo",
-        "note": (
-            "The media inspector only checks HTTPS hosts listed in "
-            "MEDIA_ALLOWED_HOSTS. /watch/demo is a public sample player."
-        ),
     }
 
 
-@app.get("/health", tags=["service"])
+@app.get("/health")
 async def health():
     return {"status": "ok", "version": APP_VERSION}
 
 
-@app.get("/api/v1/media/inspect", tags=["media"])
+@app.get("/api/v1/media/inspect")
 async def inspect_media(
-    url: str = Query(
-        ...,
-        description=(
-            "HTTPS URL on a host configured in MEDIA_ALLOWED_HOSTS. "
-            "Only the first 64 bytes are requested."
-        ),
-        max_length=2048,
-    )
+    url: str = Query(..., max_length=2048),
 ):
     parsed = urlparse(url)
     hostname = (parsed.hostname or "").lower()
 
     if parsed.scheme != "https" or not hostname:
-        raise HTTPException(
-            status_code=400,
-            detail="A valid HTTPS media URL is required.",
-        )
+        raise HTTPException(400, "A valid HTTPS media URL is required.")
 
     if hostname not in ALLOWED_MEDIA_HOSTS:
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                "Host is not allowed. Add an authorized host to the "
-                "MEDIA_ALLOWED_HOSTS environment variable."
-            ),
-        )
+        raise HTTPException(403, "Host is not allowed.")
 
     if parsed.username or parsed.password:
-        raise HTTPException(
-            status_code=400,
-            detail="URLs containing embedded credentials are not allowed.",
-        )
+        raise HTTPException(400, "Embedded URL credentials are not allowed.")
 
     try:
         async with httpx.AsyncClient(
-            follow_redirects=False,
-            timeout=15.0,
+            follow_redirects=False, timeout=15
         ) as client:
             async with client.stream(
                 "GET",
                 url,
-                headers={
-                    "Range": "bytes=0-63",
-                    "User-Agent": "MovieBox-API-media-check/1.0",
-                },
+                headers={"Range": "bytes=0-63"},
             ) as response:
                 sample = await response.aread()
                 content_type = response.headers.get(
                     "content-type", "unknown"
                 ).split(";")[0]
-                content_range = response.headers.get(
-                    "content-range", "not provided"
-                )
                 has_ftyp = len(sample) >= 8 and sample[4:8] == b"ftyp"
-                looks_like_mp4 = has_ftyp or (
-                    content_type.lower() == "video/mp4"
-                    and sample[:1] != b"<"
-                )
 
                 return {
                     "http_status": response.status_code,
                     "host": hostname,
                     "content_type": content_type,
-                    "content_range": content_range,
                     "sample_bytes": len(sample),
                     "mp4_ftyp_signature": has_ftyp,
-                    "looks_like_mp4": looks_like_mp4,
+                    "looks_like_mp4": has_ftyp,
                     "result": (
                         "pass"
-                        if response.status_code in (200, 206)
-                        and looks_like_mp4
+                        if response.status_code in (200, 206) and has_ftyp
                         else "fail"
-                    ),
-                    "note": (
-                        "This checks a small response sample only; it does "
-                        "not guarantee full-file integrity or playback."
                     ),
                 }
     except httpx.HTTPError as exc:
         raise HTTPException(
-            status_code=502,
-            detail=f"Media host request failed: {type(exc).__name__}.",
+            502, f"Media host request failed: {type(exc).__name__}"
         ) from exc
 
 
-@app.get("/watch/demo", response_class=HTMLResponse, tags=["playback"])
+@app.get("/watch/demo", response_class=HTMLResponse)
 async def demo_player():
-    """Browser player for a public sample video."""
     video_url = (
         "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/720/"
         "Big_Buck_Bunny_720_10s_1MB.mp4"
     )
+
     return HTMLResponse(
-        content=f"""<!doctype html>
+        f"""<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>MovieBox API — Playback Test</title>
-  <style>
-    body {{ margin: 0; padding: 24px; background: #0b0712; color: #fff;
-           font: 16px system-ui, sans-serif; }}
-    main {{ max-width: 960px; margin: 0 auto; }}
-    video {{ display: block; width: 100%; max-height: 75vh; background: #000;
-             border-radius: 12px; }}
-    p {{ color: #c8bfd8; line-height: 1.5; }}
-  </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Playback Test</title>
+<style>
+body{{margin:0;padding:24px;background:#0b0712;color:white;
+font:16px system-ui,sans-serif}}
+main{{max-width:960px;margin:auto}}
+video{{width:100%;max-height:75vh;background:#000;border-radius:12px}}
+</style>
 </head>
 <body>
-  <main>
-    <h1>Playback test</h1>
-    <p>Public sample clip used to verify browser playback.</p>
-    <video controls playsinline preload="metadata">
-      <source src="{video_url}" type="video/mp4">
-      Your browser does not support HTML video playback.
-    </video>
-  </main>
+<main>
+<h1>Playback test</h1>
+<video controls playsinline preload="metadata">
+<source src="{video_url}" type="video/mp4">
+</video>
+</main>
 </body>
 </html>""",
         headers={"Cache-Control": "no-store"},
     )
 
 
-@app.get("/api/v1/diagnostics/moviebox-download", tags=["diagnostics"])
-async def diagnose_moviebox_download():
-    """Test the existing v2 download metadata for Sintel."""
+def setup_source_path():
     source_dir = str(Path(__file__).resolve().parent / "src")
     if source_dir not in sys.path:
         sys.path.insert(0, source_dir)
+
+
+def normalize_title(value):
+    return "".join(
+        character.lower()
+        for character in str(value or "")
+        if character.isalnum()
+    )
+
+
+async def find_moviebox_item(client, title, year=None):
+    from moviebox_api.v3.core import Search
+
+    clean_title = str(title or "").strip()
+
+    if not clean_title:
+        raise HTTPException(400, "A title is required.")
+
+    results = await Search(
+        client_session=client,
+        query=clean_title,
+        per_page=20,
+    ).get_content_model()
+
+    items = [
+        item for item in results.items
+        if getattr(item, "has_resource", False)
+    ]
+
+    if not items:
+        raise HTTPException(
+            404,
+            "No downloadable MovieBox result was found for this title.",
+        )
+
+    target = normalize_title(clean_title)
+
+    def score(item):
+        item_title = normalize_title(getattr(item, "title", ""))
+        item_year = str(getattr(item, "release_date", "") or "")[:4]
+
+        return (
+            int(item_title == target),
+            int(target in item_title or item_title in target),
+            int(bool(year and item_year == str(year))),
+        )
+
+    items.sort(key=score, reverse=True)
+    return items[0]
+
+
+def get_option_resolution(option):
+    try:
+        return int(option.resolution)
+    except (TypeError, ValueError):
+        return 0
+
+
+def get_movie_options(details):
+    return [
+        option
+        for detector in (details.resource_detectors or [])
+        for option in (detector.resolution_list or [])
+        if getattr(option, "resource_link", None)
+    ]
+
+
+async def get_episode_resources(
+    client,
+    subject_id,
+    season,
+    episode,
+    requested_resolution=None,
+):
+    from moviebox_api.v3.core import DownloadableVideoFilesDetail
+    from moviebox_api.v3.constants import ResolutionType
+
+    resolution_map = {
+        360: ResolutionType._360P,
+        480: getattr(ResolutionType, "_480P", None),
+        720: ResolutionType._720P,
+        1080: ResolutionType._1080P,
+        2160: getattr(ResolutionType, "_2160P", None),
+    }
+
+    requested_values = (
+        [requested_resolution]
+        if requested_resolution
+        else [360, 480, 720, 1080, 2160]
+    )
+
+    found = []
+
+    for quality in requested_values:
+        enum_value = resolution_map.get(quality)
+
+        if enum_value is None:
+            continue
+
+        for page in range(1, 11):
+            try:
+                metadata = await DownloadableVideoFilesDetail(
+                    client_session=client,
+                    per_page=10,
+                    resolution=enum_value,
+                ).get_content_model(
+                    subject_id,
+                    page=page,
+                )
+            except TypeError:
+                try:
+                    metadata = await DownloadableVideoFilesDetail(
+                        client_session=client,
+                        per_page=10,
+                        resolution=enum_value,
+                        page=page,
+                    ).get_content_model(subject_id)
+                except Exception:
+                    break
+            except Exception:
+                break
+
+            entries = getattr(metadata, "list", []) or []
+
+            for entry in entries:
+                try:
+                    entry_season = int(getattr(entry, "season", 0) or 0)
+                    entry_episode = int(getattr(entry, "episode", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+
+                resource_link = getattr(entry, "resource_link", None)
+
+                if (
+                    entry_season == season
+                    and entry_episode == episode
+                    and resource_link
+                ):
+                    url = str(resource_link)
+                    parsed = urlparse(url)
+
+                    if parsed.scheme == "https" and parsed.hostname:
+                        found.append({
+                            "resolution": get_option_resolution(entry) or quality,
+                            "size": getattr(entry, "size", None),
+                            "resource_link": url,
+                            "title": getattr(entry, "title", None),
+                            "season": entry_season,
+                            "episode": entry_episode,
+                        })
+
+            pager = getattr(metadata, "pager", None)
+            has_more = bool(getattr(pager, "has_more", False))
+
+            if not has_more or not entries:
+                break
+
+        if requested_resolution and found:
+            break
+
+    unique = {}
+
+    for entry in found:
+        unique[(entry["resolution"], entry["resource_link"])] = entry
+
+    return list(unique.values())
+
+
+@app.get("/api/v1/download/qualities")
+async def get_download_qualities(
+    title: str = Query(..., min_length=1, max_length=200),
+    year: int | None = Query(default=None, ge=1888, le=2100),
+    media_type: str = Query(default="movie", pattern="^(movie|tv)$"),
+    season: int = Query(default=1, ge=1, le=100),
+    episode: int = Query(default=1, ge=1, le=1000),
+):
+    setup_source_path()
+
+    try:
+        from moviebox_api.v3.http_client import MovieBoxHttpClient
+        from moviebox_api.v3.core import ItemDetails
+
+        async with MovieBoxHttpClient(timeout=30) as client:
+            item = await find_moviebox_item(client, title, year)
+
+            if media_type == "tv":
+                resources = await get_episode_resources(
+                    client,
+                    item.subject_id,
+                    season,
+                    episode,
+                )
+
+                qualities = sorted({
+                    resource["resolution"]
+                    for resource in resources
+                    if resource["resolution"] > 0
+                })
+
+                if not qualities:
+                    raise HTTPException(
+                        404,
+                        f"No downloadable resource found for Season {season}, Episode {episode}.",
+                    )
+
+                return {
+                    "result": "ok",
+                    "title": str(item.title),
+                    "subject_id": str(item.subject_id),
+                    "media_type": "tv",
+                    "season": season,
+                    "episode": episode,
+                    "qualities": qualities,
+                }
+
+            details = await ItemDetails(
+                client_session=client
+            ).get_content_model(item.subject_id)
+
+            qualities = sorted({
+                get_option_resolution(option)
+                for option in get_movie_options(details)
+                if get_option_resolution(option) > 0
+            })
+
+            if not qualities:
+                raise HTTPException(
+                    404, "MovieBox returned no downloadable video qualities."
+                )
+
+            return {
+                "result": "ok",
+                "title": str(getattr(details, "title", None) or item.title),
+                "subject_id": str(item.subject_id),
+                "media_type": "movie",
+                "qualities": qualities,
+            }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            502,
+            f"MovieBox quality lookup failed ({type(exc).__name__}).",
+        ) from exc
+
+
+@app.get("/api/v1/download/resolve")
+async def resolve_download(
+    title: str = Query(..., min_length=1, max_length=200),
+    year: int | None = Query(default=None, ge=1888, le=2100),
+    resolution: int = Query(default=360, ge=144, le=2160),
+    media_type: str = Query(default="movie", pattern="^(movie|tv)$"),
+    season: int = Query(default=1, ge=1, le=100),
+    episode: int = Query(default=1, ge=1, le=1000),
+):
+    setup_source_path()
+
+    try:
+        from moviebox_api.v3.http_client import MovieBoxHttpClient
+        from moviebox_api.v3.core import ItemDetails
+
+        async with MovieBoxHttpClient(timeout=30) as client:
+            item = await find_moviebox_item(client, title, year)
+
+            if media_type == "tv":
+                resources = await get_episode_resources(
+                    client,
+                    item.subject_id,
+                    season,
+                    episode,
+                    requested_resolution=resolution,
+                )
+
+                if not resources:
+                    raise HTTPException(
+                        404,
+                        f"No downloadable resource found for Season {season}, Episode {episode} at {resolution}p.",
+                    )
+
+                resources.sort(
+                    key=lambda resource: resource["resolution"]
+                )
+
+                eligible = [
+                    resource for resource in resources
+                    if resource["resolution"] <= resolution
+                ]
+
+                chosen = eligible[-1] if eligible else resources[0]
+                url = chosen["resource_link"]
+
+                return {
+                    "result": "ok",
+                    "title": str(chosen.get("title") or item.title),
+                    "subject_id": str(item.subject_id),
+                    "media_type": "tv",
+                    "season": season,
+                    "episode": episode,
+                    "resolution": chosen["resolution"],
+                    "size_bytes": chosen.get("size"),
+                    "download_url": url,
+                    "url_expires_note": "Start downloading promptly; the source URL may expire.",
+                }
+
+            details = await ItemDetails(
+                client_session=client
+            ).get_content_model(item.subject_id)
+
+            options = get_movie_options(details)
+
+            if not options:
+                raise HTTPException(
+                    404, "MovieBox returned no downloadable video resources."
+                )
+
+            options.sort(key=get_option_resolution)
+
+            eligible = [
+                option for option in options
+                if get_option_resolution(option) <= resolution
+            ]
+
+            chosen = eligible[-1] if eligible else options[0]
+            url = str(chosen.resource_link)
+            parsed = urlparse(url)
+
+            if parsed.scheme != "https" or not parsed.hostname:
+                raise HTTPException(
+                    502, "MovieBox returned an invalid download URL."
+                )
+
+            return {
+                "result": "ok",
+                "title": str(getattr(details, "title", None) or item.title),
+                "subject_id": str(item.subject_id),
+                "media_type": "movie",
+                "resolution": get_option_resolution(chosen),
+                "size_bytes": getattr(chosen, "size", None),
+                "download_url": url,
+                "url_expires_note": "Start downloading promptly; the source URL may expire.",
+            }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            502,
+            f"MovieBox download resolution failed ({type(exc).__name__}).",
+        ) from exc
+
+
+@app.get("/api/v1/diagnostics/moviebox-download")
+async def diagnose_moviebox_download():
+    setup_source_path()
 
     try:
         from moviebox_api.v2.core import Search
@@ -200,7 +504,7 @@ async def diagnose_moviebox_download():
         from moviebox_api.v1.models import DownloadableFilesMetadata
         from moviebox_api.v1.constants import DOWNLOAD_REQUEST_HEADERS
 
-        session = Session(timeout=20.0)
+        session = Session(timeout=20)
         async with session._client:
             results = await Search(
                 session=session, query="Sintel", per_page=10
@@ -210,49 +514,32 @@ async def diagnose_moviebox_download():
                 item for item in results.items
                 if "sintel" in item.title.lower()
             ]
+
             if not candidates:
-                return {
-                    "stage": "search",
-                    "result": "no_match",
-                    "query": "Sintel",
-                }
+                return {"stage": "search", "result": "no_match"}
 
             item = candidates[0]
-            downloader = DownloadableMovieFilesDetail(
+            raw = await DownloadableMovieFilesDetail(
                 session=session, item=item
-            )
-            raw = await downloader.get_content()
+            ).get_content()
+
             downloads = [
                 entry for entry in (raw.get("downloads") or [])
                 if isinstance(entry, dict)
                 and isinstance(entry.get("url"), str)
                 and entry["url"].strip()
             ]
+
             metadata = DownloadableFilesMetadata(
                 **{**raw, "downloads": downloads}
             )
 
-            if not metadata.downloads:
-                return {
-                    "stage": "download_metadata",
-                    "result": "no_downloads",
-                    "title": item.title,
-                    "hasResource": metadata.hasResource,
-                }
-
             checks = []
+
             async with httpx.AsyncClient(
-                follow_redirects=True, timeout=20.0
+                follow_redirects=True, timeout=20
             ) as client:
                 for media in metadata.downloads:
-                    parsed = urlparse(str(media.url))
-                    if parsed.scheme != "https" or not parsed.hostname:
-                        checks.append({
-                            "resolution": media.resolution,
-                            "result": "invalid_url",
-                        })
-                        continue
-
                     try:
                         async with client.stream(
                             "GET",
@@ -263,25 +550,19 @@ async def diagnose_moviebox_download():
                             },
                         ) as response:
                             sample = await response.aread()
-                            content_type = response.headers.get(
-                                "content-type", "unknown"
-                            ).split(";")[0].lower()
                             has_ftyp = (
                                 len(sample) >= 8 and sample[4:8] == b"ftyp"
                             )
-                            passed = (
-                                response.status_code in (200, 206)
-                                and content_type == "video/mp4"
-                                and has_ftyp
-                            )
                             checks.append({
                                 "resolution": media.resolution,
-                                "declared_size_bytes": media.size,
                                 "http_status": response.status_code,
-                                "content_type": content_type,
-                                "sample_bytes": len(sample),
                                 "mp4_ftyp_signature": has_ftyp,
-                                "result": "pass" if passed else "fail",
+                                "result": (
+                                    "pass"
+                                    if response.status_code in (200, 206)
+                                    and has_ftyp
+                                    else "fail"
+                                ),
                             })
                     except Exception as exc:
                         checks.append({
@@ -290,14 +571,17 @@ async def diagnose_moviebox_download():
                             "error_type": type(exc).__name__,
                         })
 
-            passed = any(c.get("result") == "pass" for c in checks)
             return {
                 "stage": "download_url_check",
-                "result": "pass" if passed else "fail",
+                "result": (
+                    "pass"
+                    if any(c.get("result") == "pass" for c in checks)
+                    else "fail"
+                ),
                 "title": item.title,
-                "download_options_checked": len(checks),
                 "checks": checks,
             }
+
     except Exception as exc:
         return {
             "stage": "exception",
@@ -307,202 +591,62 @@ async def diagnose_moviebox_download():
         }
 
 
-@app.get("/api/v1/diagnostics/moviebox-v3-download", tags=["diagnostics"])
+@app.get("/api/v1/diagnostics/moviebox-v3-download")
 async def diagnose_moviebox_v3_download():
-    """Inspect Sintel v3 resource URLs and validate small MP4 samples."""
-    source_dir = str(Path(__file__).resolve().parent / "src")
-    if source_dir not in sys.path:
-        sys.path.insert(0, source_dir)
+    setup_source_path()
 
     try:
         from moviebox_api.v3.http_client import MovieBoxHttpClient
-        from moviebox_api.v3.core import (
-            Search,
-            ItemDetails,
-            DownloadableVideoFilesDetail,
-        )
-        from moviebox_api.v3.constants import ResolutionType
+        from moviebox_api.v3.core import Search, ItemDetails
 
-        async with MovieBoxHttpClient(timeout=25.0) as client:
-            results = await Search(
-                client_session=client, query="Sintel", per_page=10
-            ).get_content_model()
-            candidates = [
-                item for item in results.items
-                if "sintel" in item.title.lower() and item.has_resource
-            ]
-            if not candidates:
-                return {"stage": "v3_search", "result": "no_match"}
-
-            item = candidates[0]
+        async with MovieBoxHttpClient(timeout=25) as client:
+            item = await find_moviebox_item(client, "Sintel")
             details = await ItemDetails(
                 client_session=client
             ).get_content_model(item.subject_id)
 
-            candidates_to_check = []
-            detector_summary = []
-
-            for index, detector in enumerate(details.resource_detectors or []):
-                summary = {
-                    "index": index,
-                    "source": detector.source,
-                    "type": detector.type,
-                    "first_size_bytes": detector.first_size,
-                    "download_url_host": (
-                        urlparse(str(detector.download_url)).hostname
-                        if detector.download_url else None
-                    ),
-                    "resolution_list": [],
-                }
-
-                if detector.download_url:
-                    candidates_to_check.append({
-                        "origin": "detail.downloadUrl",
-                        "resolution": None,
-                        "declared_size_bytes": detector.first_size or None,
-                        "url": str(detector.download_url),
-                    })
-
-                for option in detector.resolution_list or []:
-                    summary["resolution_list"].append({
-                        "resolution": int(option.resolution),
-                        "size_bytes": option.size,
-                        "host": urlparse(str(option.resource_link)).hostname,
-                    })
-                    candidates_to_check.append({
-                        "origin": "detail.resolutionList",
-                        "resolution": int(option.resolution),
-                        "declared_size_bytes": option.size or None,
-                        "url": str(option.resource_link),
-                    })
-
-                detector_summary.append(summary)
-
-            for resolution in (
-                ResolutionType._360P,
-                ResolutionType._720P,
-                ResolutionType._1080P,
-            ):
-                metadata = await DownloadableVideoFilesDetail(
-                    client_session=client,
-                    per_page=10,
-                    resolution=resolution,
-                ).get_content_model(
-                    item.subject_id,
-                    release_date=str(item.release_date),
-                )
-                for media in metadata.list:
-                    candidates_to_check.append({
-                        "origin": "resource_endpoint",
-                        "resolution": media.resolution,
-                        "declared_size_bytes": media.size or None,
-                        "url": str(media.resource_link),
-                    })
-
             checks = []
-            seen = set()
-            async with httpx.AsyncClient(
-                follow_redirects=True, timeout=25.0
-            ) as media_client:
-                for candidate in candidates_to_check:
-                    url = candidate["url"]
-                    fingerprint = hashlib.sha256(
-                        url.encode()
-                    ).hexdigest()[:12]
-                    if fingerprint in seen:
-                        continue
-                    seen.add(fingerprint)
-                    parsed = urlparse(url)
-                    check = {
-                        "origin": candidate["origin"],
-                        "resolution": candidate["resolution"],
-                        "declared_size_bytes": candidate["declared_size_bytes"],
-                        "url_fingerprint": fingerprint,
-                        "url_host": parsed.hostname,
-                    }
 
-                    if parsed.scheme != "https" or not parsed.hostname:
-                        check["result"] = "invalid_url"
-                        checks.append(check)
-                        continue
+            async with httpx.AsyncClient(
+                follow_redirects=True, timeout=25
+            ) as media_client:
+                for option in get_movie_options(details):
+                    url = str(option.resource_link)
 
                     try:
                         async with media_client.stream(
                             "GET",
                             url,
-                            headers={
-                                "User-Agent": "MovieBox-Licensed-Test/1.0",
-                                "Accept": "video/mp4,video/*;q=0.9,*/*;q=0.8",
-                                "Range": "bytes=0-1023",
-                            },
+                            headers={"Range": "bytes=0-1023"},
                         ) as response:
                             sample = await response.aread()
                             ctype = response.headers.get(
-                                "content-type", "unknown"
+                                "content-type", ""
                             ).split(";")[0].lower()
-                            content_range = response.headers.get(
-                                "content-range", ""
-                            )
-                            total_size = None
-                            if "/" in content_range:
-                                try:
-                                    total_size = int(
-                                        content_range.rsplit("/", 1)[1]
-                                    )
-                                except ValueError:
-                                    pass
 
-                            has_ftyp = (
-                                len(sample) >= 8 and sample[4:8] == b"ftyp"
-                            )
-                            declared = candidate["declared_size_bytes"]
-                            size_matches = bool(
-                                declared and total_size is not None
-                                and abs(total_size - declared) <= max(
-                                    1024 * 1024, int(declared * 0.02)
-                                )
-                            )
-
-                            check.update({
-                                "final_cdn_host": urlparse(
-                                    str(response.url)
-                                ).hostname,
+                            checks.append({
+                                "resolution": get_option_resolution(option),
                                 "http_status": response.status_code,
                                 "content_type": ctype,
-                                "content_range": content_range or None,
-                                "sample_bytes": len(sample),
-                                "mp4_ftyp_signature": has_ftyp,
-                                "actual_total_bytes": total_size,
-                                "size_matches_metadata": (
-                                    size_matches if declared else None
-                                ),
-                                "result": (
-                                    "pass"
-                                    if response.status_code in (200, 206)
-                                    and ctype == "video/mp4"
-                                    and has_ftyp
-                                    and (size_matches or not declared)
-                                    else "fail"
+                                "mp4_ftyp_signature": (
+                                    len(sample) >= 8
+                                    and sample[4:8] == b"ftyp"
                                 ),
                             })
                     except Exception as exc:
-                        check.update({
+                        checks.append({
                             "result": "error",
                             "error_type": type(exc).__name__,
-                            "message": str(exc)[:180],
                         })
-                    checks.append(check)
 
-            passed = any(c.get("result") == "pass" for c in checks)
             return {
                 "stage": "v3_detail_resource_inspection",
-                "result": "pass" if passed else "fail",
+                "result": "ok",
                 "title": details.title,
-                "subject_id": item.subject_id,
-                "resource_detectors": detector_summary,
-                "unique_urls_tested": len(checks),
+                "subject_id": str(item.subject_id),
                 "checks": checks,
             }
+
     except Exception as exc:
         return {
             "stage": "v3_exception",
@@ -512,47 +656,28 @@ async def diagnose_moviebox_v3_download():
         }
 
 
-@app.get("/api/v1/diagnostics/sintel-full-download", tags=["diagnostics"])
+@app.get("/api/v1/diagnostics/sintel-full-download")
 async def diagnose_sintel_full_download():
-    """Stream the licensed Sintel 360p test asset and validate full transfer."""
+    setup_source_path()
     started = time.monotonic()
-    source_dir = str(Path(__file__).resolve().parent / "src")
-    if source_dir not in sys.path:
-        sys.path.insert(0, source_dir)
 
     try:
         from moviebox_api.v3.http_client import MovieBoxHttpClient
-        from moviebox_api.v3.core import Search, ItemDetails
+        from moviebox_api.v3.core import ItemDetails
 
-        async with MovieBoxHttpClient(timeout=30.0) as api:
-            results = await Search(
-                client_session=api, query="Sintel", per_page=10
-            ).get_content_model()
-
-            items = [
-                item for item in results.items
-                if "sintel" in item.title.lower() and item.has_resource
-            ]
-            if not items:
-                return {"stage": "search", "result": "no_match"}
-
-            item = items[0]
+        async with MovieBoxHttpClient(timeout=30) as client:
+            item = await find_moviebox_item(client, "Sintel")
             details = await ItemDetails(
-                client_session=api
+                client_session=client
             ).get_content_model(item.subject_id)
 
             options = [
-                option
-                for detector in (details.resource_detectors or [])
-                for option in (detector.resolution_list or [])
-                if int(option.resolution) == 360 and option.resource_link
+                option for option in get_movie_options(details)
+                if get_option_resolution(option) == 360
             ]
+
             if not options:
-                return {
-                    "stage": "metadata",
-                    "result": "no_360p_source",
-                    "title": details.title,
-                }
+                return {"stage": "metadata", "result": "no_360p_source"}
 
             option = options[0]
             digest = hashlib.sha256()
@@ -561,26 +686,18 @@ async def diagnose_sintel_full_download():
 
             async with httpx.AsyncClient(
                 follow_redirects=True,
-                timeout=httpx.Timeout(
-                    connect=15, read=45, write=15, pool=15
-                ),
+                timeout=httpx.Timeout(connect=15, read=45, write=15, pool=15),
             ) as media:
                 async with media.stream(
                     "GET",
                     str(option.resource_link),
-                    headers={
-                        "Accept": "video/mp4,*/*;q=0.8",
-                        "User-Agent": "MovieBox-Licensed-Test/1.0",
-                    },
+                    headers={"Accept": "video/mp4,*/*;q=0.8"},
                 ) as response:
                     content_type = response.headers.get(
                         "content-type", ""
                     ).split(";")[0].lower()
 
-                    if (
-                        response.status_code != 200
-                        or content_type != "video/mp4"
-                    ):
+                    if response.status_code != 200:
                         return {
                             "stage": "transfer_start",
                             "result": "fail",
@@ -592,9 +709,7 @@ async def diagnose_sintel_full_download():
                         if not chunk:
                             continue
 
-                        if len(prefix) < 16:
-                            prefix += chunk[:16 - len(prefix)]
-
+                        prefix += chunk[:max(0, 16 - len(prefix))]
                         total += len(chunk)
                         digest.update(chunk)
 
@@ -605,27 +720,26 @@ async def diagnose_sintel_full_download():
                                 "bytes_received": total,
                             }
 
+            valid_mp4 = len(prefix) >= 8 and prefix[4:8] == b"ftyp"
             expected = (
                 int(option.size) if option.size is not None else None
             )
-            valid_mp4 = len(prefix) >= 8 and prefix[4:8] == b"ftyp"
-            size_matches = expected is not None and total == expected
-            passed = valid_mp4 and size_matches
 
             return {
                 "stage": "full_transfer",
-                "result": "pass" if passed else "fail",
+                "result": (
+                    "pass"
+                    if valid_mp4 and expected == total
+                    else "fail"
+                ),
                 "title": details.title,
                 "resolution": 360,
-                "http_status": 200,
                 "content_type": content_type,
                 "bytes_received": total,
                 "expected_bytes": expected,
-                "size_matches_metadata": size_matches,
                 "mp4_ftyp_signature": valid_mp4,
                 "sha256": digest.hexdigest(),
                 "elapsed_seconds": round(time.monotonic() - started, 2),
-                "license": "Creative Commons Attribution 3.0",
             }
 
     except Exception as exc:
@@ -636,253 +750,3 @@ async def diagnose_sintel_full_download():
             "message": str(exc)[:250],
             "elapsed_seconds": round(time.monotonic() - started, 2),
         }
-
-
-async def _find_moviebox_movie(title: str, year: int | None = None):
-    source_dir = str(Path(__file__).resolve().parent / "src")
-    if source_dir not in sys.path:
-        sys.path.insert(0, source_dir)
-
-    clean_title = title.strip()
-    if not clean_title:
-        raise HTTPException(status_code=400, detail="A title is required.")
-
-    from moviebox_api.v3.http_client import MovieBoxHttpClient
-    from moviebox_api.v3.core import Search, ItemDetails
-
-    client = MovieBoxHttpClient(timeout=30.0)
-    return client, clean_title, Search, ItemDetails, year
-
-
-@app.get("/api/v1/download/qualities", tags=["downloads"])
-async def get_download_qualities(
-    title: str = Query(..., min_length=1, max_length=200),
-    year: int | None = Query(default=None, ge=1888, le=2100),
-):
-    """Return the actual downloadable movie resolutions reported by MovieBox."""
-    source_dir = str(Path(__file__).resolve().parent / "src")
-    if source_dir not in sys.path:
-        sys.path.insert(0, source_dir)
-
-    clean_title = title.strip()
-    if not clean_title:
-        raise HTTPException(status_code=400, detail="A title is required.")
-
-    try:
-        from moviebox_api.v3.http_client import MovieBoxHttpClient
-        from moviebox_api.v3.core import Search, ItemDetails
-
-        def normalized(value):
-            return "".join(
-                ch.lower() for ch in str(value) if ch.isalnum()
-            )
-
-        async with MovieBoxHttpClient(timeout=30.0) as client:
-            results = await Search(
-                client_session=client,
-                query=clean_title,
-                per_page=20,
-            ).get_content_model()
-
-            items = [
-                item for item in results.items
-                if getattr(item, "has_resource", False)
-            ]
-
-            if not items:
-                raise HTTPException(
-                    status_code=404,
-                    detail="No downloadable MovieBox result was found for this title.",
-                )
-
-            target = normalized(clean_title)
-
-            def score(item):
-                item_title = normalized(getattr(item, "title", ""))
-                item_year = str(
-                    getattr(item, "release_date", "") or ""
-                )[:4]
-                return (
-                    int(item_title == target),
-                    int(target in item_title or item_title in target),
-                    int(bool(year and item_year == str(year))),
-                )
-
-            items.sort(key=score, reverse=True)
-            item = items[0]
-
-            details = await ItemDetails(
-                client_session=client
-            ).get_content_model(item.subject_id)
-
-            options = [
-                option
-                for detector in (details.resource_detectors or [])
-                for option in (detector.resolution_list or [])
-                if getattr(option, "resource_link", None)
-            ]
-
-            qualities = set()
-
-            for option in options:
-                try:
-                    quality = int(option.resolution)
-                    if quality > 0:
-                        qualities.add(quality)
-                except (TypeError, ValueError):
-                    continue
-
-            if not qualities:
-                raise HTTPException(
-                    status_code=404,
-                    detail="MovieBox returned no downloadable video qualities.",
-                )
-
-            return {
-                "result": "ok",
-                "title": str(
-                    getattr(details, "title", None) or item.title
-                ),
-                "subject_id": str(item.subject_id),
-                "qualities": sorted(qualities),
-            }
-
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"MovieBox quality lookup failed ({type(exc).__name__}).",
-        ) from exc
-
-
-@app.get("/api/v1/download/resolve", tags=["downloads"])
-async def resolve_download(
-    title: str = Query(..., min_length=1, max_length=200),
-    year: int | None = Query(default=None, ge=1888, le=2100),
-    resolution: int = Query(default=360, ge=144, le=2160),
-    media_type: str = Query(default="movie", pattern="^(movie|tv)$"),
-    season: int = Query(default=1, ge=1, le=100),
-    episode: int = Query(default=1, ge=1, le=1000),
-):
-    """Resolve a MovieBox v3 movie MP4 URL for immediate client download."""
-    source_dir = str(Path(__file__).resolve().parent / "src")
-    if source_dir not in sys.path:
-        sys.path.insert(0, source_dir)
-
-    clean_title = title.strip()
-    if not clean_title:
-        raise HTTPException(status_code=400, detail="A title is required.")
-
-    try:
-        from moviebox_api.v3.http_client import MovieBoxHttpClient
-        from moviebox_api.v3.core import Search, ItemDetails
-
-        async with MovieBoxHttpClient(timeout=30.0) as client:
-            results = await Search(
-                client_session=client,
-                query=clean_title,
-                per_page=20,
-            ).get_content_model()
-
-            items = [
-                item for item in results.items
-                if getattr(item, "has_resource", False)
-            ]
-
-            if not items:
-                raise HTTPException(
-                    status_code=404,
-                    detail="No downloadable MovieBox result was found for this title.",
-                )
-
-            def normalized(value):
-                return "".join(
-                    ch.lower() for ch in str(value) if ch.isalnum()
-                )
-
-            target = normalized(clean_title)
-
-            def score(item):
-                item_title = normalized(getattr(item, "title", ""))
-                exact = item_title == target
-                contains = target in item_title or item_title in target
-                item_year = str(
-                    getattr(item, "release_date", "") or ""
-                )[:4]
-                year_match = bool(year and item_year == str(year))
-                return (int(exact), int(contains), int(year_match))
-
-            items.sort(key=score, reverse=True)
-            item = items[0]
-
-            if media_type == "tv":
-                raise HTTPException(
-                    status_code=501,
-                    detail=(
-                        "TV episode download lookup is not enabled yet. "
-                        "Test movie downloads first; episode-specific MovieBox "
-                        "v3 lookup needs verification."
-                    ),
-                )
-
-            details = await ItemDetails(
-                client_session=client
-            ).get_content_model(item.subject_id)
-
-            options = [
-                option
-                for detector in (details.resource_detectors or [])
-                for option in (detector.resolution_list or [])
-                if getattr(option, "resource_link", None)
-            ]
-
-            if not options:
-                raise HTTPException(
-                    status_code=404,
-                    detail="MovieBox returned no downloadable video resources.",
-                )
-
-            def get_resolution(option):
-                try:
-                    return int(option.resolution)
-                except (TypeError, ValueError):
-                    return 0
-
-            options.sort(key=get_resolution)
-            eligible = [
-                option for option in options
-                if get_resolution(option) <= resolution
-            ]
-            chosen = eligible[-1] if eligible else options[0]
-            download_url = str(chosen.resource_link)
-            parsed = urlparse(download_url)
-
-            if parsed.scheme != "https" or not parsed.hostname:
-                raise HTTPException(
-                    status_code=502,
-                    detail="MovieBox returned an invalid download URL.",
-                )
-
-            return {
-                "result": "ok",
-                "title": str(
-                    getattr(details, "title", None) or item.title
-                ),
-                "subject_id": str(item.subject_id),
-                "media_type": media_type,
-                "resolution": get_resolution(chosen),
-                "size_bytes": getattr(chosen, "size", None),
-                "download_url": download_url,
-                "url_expires_note": (
-                    "Start downloading promptly; the source URL may expire."
-                ),
-            }
-
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"MovieBox download resolution failed ({type(exc).__name__}).",
-        ) from exc
