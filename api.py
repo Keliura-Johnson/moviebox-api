@@ -1,4 +1,3 @@
-
 import os
 import sys
 import time
@@ -311,100 +310,71 @@ async def get_episode_resources(
     episode,
     requested_resolution=None,
 ):
-    from moviebox_api.v3.core import DownloadableVideoFilesDetail
-    from moviebox_api.v3.constants import CustomResolutionType
+    """Get a chosen TV episode using the same details/resource path as movies.
+
+    Movie downloads use ItemDetails.resource_detectors[].resolution_list.
+    TV episode resolution entries expose the same resource_link and resolution
+    fields, plus season (`se`) and episode (`ep`) identifiers. Filter those
+    detail resources for the requested episode rather than searching a generic
+    resource listing that may include unrelated/placeholder links.
+    """
+    from moviebox_api.v3.core import ItemDetails
 
     if season < 1 or episode < 1:
         raise HTTPException(
             400, "Season and episode must be positive numbers."
         )
 
-    qualities = (
-        [int(requested_resolution)]
-        if requested_resolution is not None
-        else [360, 480, 720, 1080, 2160]
-    )
+    try:
+        details = await ItemDetails(
+            client_session=client
+        ).get_content_model(subject_id)
+    except Exception as exc:
+        raise HTTPException(
+            502,
+            f"MovieBox episode details lookup failed ({type(exc).__name__}).",
+        ) from exc
 
     found = []
-    lookup_errors = []
 
-    for quality in qualities:
-        try:
-            resolution_type = CustomResolutionType(f"{quality}P")
-        except (TypeError, ValueError, AttributeError) as exc:
-            lookup_errors.append(type(exc).__name__)
-            continue
-
-        for page in range(1, 11):
+    for detector in (getattr(details, "resource_detectors", None) or []):
+        for entry in (getattr(detector, "resolution_list", None) or []):
             try:
-                downloader = DownloadableVideoFilesDetail(
-                    client_session=client,
-                    page=page,
-                    per_page=20,
-                    resolution=resolution_type,
-                )
-                metadata = await downloader.get_content_model(subject_id)
-            except Exception as exc:
-                lookup_errors.append(type(exc).__name__)
-                break
+                entry_season = int(getattr(entry, "se", 0) or 0)
+                entry_episode = int(getattr(entry, "ep", 0) or 0)
+            except (TypeError, ValueError):
+                continue
 
-            entries = list(getattr(metadata, "list", []) or [])
+            if entry_season != season or entry_episode != episode:
+                continue
 
-            for entry in entries:
-                try:
-                    entry_season = int(
-                        getattr(entry, "season", 0) or 0
-                    )
-                    entry_episode = int(
-                        getattr(entry, "episode", 0) or 0
-                    )
-                except (TypeError, ValueError):
-                    continue
+            resource_link = getattr(entry, "resource_link", None)
+            if not resource_link:
+                continue
 
-                if (
-                    entry_season != season
-                    or entry_episode != episode
-                ):
-                    continue
+            url = str(resource_link)
+            parsed = urlparse(url)
 
-                resource_link = getattr(entry, "resource_link", None)
+            if parsed.scheme != "https" or not parsed.hostname:
+                continue
 
-                if not resource_link:
-                    continue
+            if is_placeholder_resource(entry) or is_placeholder_resource(url):
+                continue
 
-                url = str(resource_link)
-                parsed = urlparse(url)
+            resolution = get_option_resolution(entry)
+            if resolution <= 0:
+                continue
 
-                if parsed.scheme != "https" or not parsed.hostname:
-                    continue
-
-                # This is the important fix: reject MovieBox's known
-                # placeholder/ad file before adding it to the download list.
-                if is_placeholder_resource(entry) or is_placeholder_resource(url):
-                    continue
-
-                found.append({
-                    "resolution": (
-                        get_option_resolution(entry) or quality
-                    ),
-                    "size": getattr(entry, "size", None),
-                    "resource_link": url,
-                    "title": getattr(entry, "title", None),
-                    "season": entry_season,
-                    "episode": entry_episode,
-                })
-
-            pager = getattr(metadata, "pager", None)
-            has_more = bool(getattr(pager, "has_more", False))
-
-            if not has_more or not entries:
-                break
-
-        if requested_resolution is not None and found:
-            break
+            found.append({
+                "resolution": resolution,
+                "size": getattr(entry, "size", None),
+                "resource_link": url,
+                "title": getattr(entry, "title", None),
+                "season": entry_season,
+                "episode": entry_episode,
+            })
 
     unique = {}
-
     for resource in found:
         key = (
             resource["season"],
@@ -414,7 +384,18 @@ async def get_episode_resources(
         )
         unique[key] = resource
 
-    return list(unique.values())
+    resources = list(unique.values())
+
+    if requested_resolution is not None:
+        requested_resolution = int(requested_resolution)
+        exact = [
+            resource for resource in resources
+            if resource["resolution"] == requested_resolution
+        ]
+        if exact:
+            return exact
+
+    return resources
 
 
 @app.get("/api/v1/download/qualities")
@@ -522,15 +503,13 @@ async def resolve_download(
                     item.subject_id,
                     season,
                     episode,
-                    requested_resolution=resolution,
                 )
 
                 if not resources:
                     raise HTTPException(
                         404,
                         f"No verified download was found for "
-                        f"Season {season}, Episode {episode} "
-                        f"at {resolution}p.",
+                        f"Season {season}, Episode {episode}.",
                     )
 
                 resources.sort(key=lambda resource: resource["resolution"])
