@@ -205,8 +205,7 @@ async def diagnose_moviebox_download():
 
             candidates = [
                 item for item in results.items
-                if "big buck bunny" in item.title.lower()
-                and str(item.subjectType).lower() in ("movies", "subjecttype.movies", "1")
+                if "sintel" in item.title.lower()
             ]
             if not candidates:
                 return {
