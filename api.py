@@ -1058,20 +1058,31 @@ async def get_tv_episode_candidates_v2(title, year, season, episode):
             session, title, year
         )
 
-        # Episode URLs can be signed and may become stale when the
-        # metadata response is reused from cache. The upstream-cache
-        # diagnostic showed different URL fingerprints for ordinary and
-        # no-cache requests, so request fresh episode metadata here.
-        session._headers = {
-            **dict(session._headers or {}),
+        # The library's normal get_content() uses Session.get(), which
+        # creates a request client without the session's bearer token.
+        # Use the session-authenticated request path for episode download
+        # metadata, and bypass cached metadata because resource URLs can be
+        # time-limited.
+        fresh_headers = {
             "Cache-Control": "no-cache, max-age=0",
             "Pragma": "no-cache",
         }
+        session._headers = {
+            **dict(session._headers or {}),
+            **fresh_headers,
+        }
+        session._client.headers.update(fresh_headers)
 
-        raw = await DownloadableTVSeriesFilesDetail(
+        downloader = DownloadableTVSeriesFilesDetail(
             session=session,
             item=item,
-        ).get_content(int(season), int(episode))
+        )
+        raw = await session.get_with_cookies_from_api(
+            url=downloader._url,
+            params=downloader._create_request_params(
+                int(season), int(episode)
+            ),
+        )
 
         downloads = raw.get("downloads", []) if isinstance(raw, dict) else []
         resources = []
