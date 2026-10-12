@@ -241,63 +241,72 @@ async def diagnose_moviebox_download():
                     "message": "Search worked, but MovieBox returned no downloadable files.",
                 }
 
-            media = metadata.best_media_file
-            media_url = str(media.url)
-            parsed_media = urlparse(media_url)
-            if parsed_media.scheme != "https" or not parsed_media.hostname:
-                return {
-                    "stage": "url_validation",
-                    "result": "fail",
-                    "title": item.title,
-                    "extension": media.ext,
-                    "message": "Returned media URL was not a valid HTTPS URL.",
-                }
-
+            request_headers = {
+                **__import__(
+                    "moviebox_api.v1.constants",
+                    fromlist=["DOWNLOAD_REQUEST_HEADERS"],
+                ).DOWNLOAD_REQUEST_HEADERS,
+                "Range": "bytes=0-63",
+            }
+            checks = []
             async with httpx.AsyncClient(
                 follow_redirects=True, timeout=20.0
             ) as client:
-                async with client.stream(
-                    "GET",
-                    media_url,
-                    headers={
-                        **__import__(
-                            "moviebox_api.v1.constants",
-                            fromlist=["DOWNLOAD_REQUEST_HEADERS"],
-                        ).DOWNLOAD_REQUEST_HEADERS,
-                        "Range": "bytes=0-63",
-                    },
-                ) as response:
-                    sample = await response.aread()
-                    content_type = response.headers.get(
-                        "content-type", "unknown"
-                    ).split(";")[0].lower()
-                    has_ftyp = len(sample) >= 8 and sample[4:8] == b"ftyp"
-                    is_mp4 = has_ftyp or (
-                        content_type == "video/mp4" and sample[:1] != b"<"
-                    )
-                    return {
-                        "stage": "download_url_check",
-                        "result": (
-                            "pass"
-                            if response.status_code in (200, 206) and is_mp4
-                            else "fail"
-                        ),
-                        "title": item.title,
-                        "extension": media.ext,
-                        "resolution": media.resolution,
-                        "declared_size_bytes": media.size,
-                        "http_status": response.status_code,
-                        "final_host": urlparse(str(response.url)).hostname,
-                        "content_type": content_type,
-                        "sample_bytes": len(sample),
-                        "mp4_ftyp_signature": has_ftyp,
-                        "looks_like_mp4": is_mp4,
-                        "message": (
-                            "A real MP4-like response was received."
-                            if response.status_code in (200, 206) and is_mp4
-                            else "The returned URL did not verify as an MP4 response."
-                        ),
-                    }
+                for media in metadata.downloads:
+                    media_url = str(media.url)
+                    parsed_media = urlparse(media_url)
+                    if parsed_media.scheme != "https" or not parsed_media.hostname:
+                        checks.append({
+                            "resolution": media.resolution,
+                            "result": "invalid_url",
+                        })
+                        continue
+                    try:
+                        async with client.stream(
+                            "GET", media_url, headers=request_headers
+                        ) as response:
+                            sample = await response.aread()
+                            content_type = response.headers.get(
+                                "content-type", "unknown"
+                            ).split(";")[0].lower()
+                            has_ftyp = len(sample) >= 8 and sample[4:8] == b"ftyp"
+                            is_mp4 = has_ftyp or (
+                                content_type == "video/mp4" and sample[:1] != b"<"
+                            )
+                            passed = response.status_code in (200, 206) and is_mp4
+                            checks.append({
+                                "resolution": media.resolution,
+                                "extension": media.ext,
+                                "declared_size_bytes": media.size,
+                                "http_status": response.status_code,
+                                "final_host": urlparse(str(response.url)).hostname,
+                                "content_type": content_type,
+                                "sample_bytes": len(sample),
+                                "mp4_ftyp_signature": has_ftyp,
+                                "looks_like_mp4": is_mp4,
+                                "result": "pass" if passed else "fail",
+                            })
+                    except Exception as check_error:
+                        checks.append({
+                            "resolution": media.resolution,
+                            "result": "error",
+                            "error_type": type(check_error).__name__,
+                            "message": str(check_error)[:200],
+                        })
+
+            passed = any(check.get("result") == "pass" for check in checks)
+            return {
+                "stage": "download_url_check",
+                "result": "pass" if passed else "fail",
+                "title": item.title,
+                "download_options_checked": len(checks),
+                "checks": checks,
+                "message": (
+                    "At least one URL returned MP4-like data."
+                    if passed
+                    else "No returned download URL passed the MP4 response check."
+                ),
+            }
     except Exception as exc:
         return {
             "stage": "exception",
