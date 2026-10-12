@@ -359,10 +359,7 @@ async def diagnose_moviebox_download():
 
 @app.get("/api/v1/diagnostics/moviebox-v3-download", tags=["diagnostics"])
 async def diagnose_moviebox_v3_download():
-    """
-    Independently tests v3's signed native API resource lookup and checks
-    whether its returned CDN URLs serve MP4 bytes. Does not return media URLs.
-    """
+    """Compare both v3 media URL fields and validate actual byte-range size."""
     import sys
     from pathlib import Path
 
@@ -390,7 +387,6 @@ async def diagnose_moviebox_v3_download():
                         {"title": item.title, "has_resource": item.has_resource}
                         for item in results.items[:10]
                     ],
-                    "message": "v3 signed search worked, but no matching item with resources was found.",
                 }
 
             item = candidates[0]
@@ -409,80 +405,83 @@ async def diagnose_moviebox_v3_download():
                     "result": "no_downloads",
                     "title": item.title,
                     "subject_id": item.subject_id,
-                    "message": "v3 found the title, but the resource endpoint returned no files.",
                 }
 
             checks = []
             async with httpx.AsyncClient(follow_redirects=True, timeout=25.0) as media_client:
                 for media in metadata.list[:6]:
-                    media_url = str(media.resource_link)
-                    parsed = urlparse(media_url)
-                    if parsed.scheme != "https" or not parsed.hostname:
-                        checks.append({
-                            "resolution": media.resolution,
-                            "result": "invalid_url",
-                        })
-                        continue
+                    for url_field, media_url in (
+                        ("resourceLink", str(media.resource_link)),
+                        ("sourceUrl", str(media.source_url)),
+                    ):
+                        parsed = urlparse(media_url)
+                        if parsed.scheme != "https" or not parsed.hostname:
+                            checks.append({
+                                "resolution": media.resolution,
+                                "url_field": url_field,
+                                "result": "invalid_url",
+                            })
+                            continue
 
-                    profiles = [
-                        {
-                            "name": "android_app",
-                            "headers": {
-                                "User-Agent": (
-                                    "com.community.oneroom/50020044 (Linux; U; Android 13; "
-                                    "en_US; 23078RKD5C; Build/TQ2A.230405.003; Cronet/135.0.7012.3)"
-                                ),
-                                "Accept": "video/mp4,video/*;q=0.9,*/*;q=0.8",
-                                "Range": "bytes=0-63",
-                            },
-                        },
-                        {
-                            "name": "generic_media",
-                            "headers": {
-                                "User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36",
-                                "Accept": "*/*",
-                                "Range": "bytes=0-63",
-                            },
-                        },
-                    ]
-                    for profile in profiles:
                         try:
                             async with media_client.stream(
-                                "GET", media_url, headers=profile["headers"]
+                                "GET",
+                                media_url,
+                                headers={
+                                    "User-Agent": (
+                                        "com.community.oneroom/50020044 (Linux; U; Android 13; "
+                                        "en_US; 23078RKD5C; Build/TQ2A.230405.003; Cronet/135.0.7012.3)"
+                                    ),
+                                    "Accept": "video/mp4,video/*;q=0.9,*/*;q=0.8",
+                                    "Range": "bytes=0-63",
+                                },
                             ) as response:
                                 sample = await response.aread()
                                 content_type = response.headers.get(
                                     "content-type", "unknown"
                                 ).split(";")[0].lower()
+                                content_range = response.headers.get("content-range", "")
+                                total_size = None
+                                if "/" in content_range:
+                                    try:
+                                        total_size = int(content_range.rsplit("/", 1)[1])
+                                    except ValueError:
+                                        pass
                                 has_ftyp = len(sample) >= 8 and sample[4:8] == b"ftyp"
-                                is_mp4 = has_ftyp or (
-                                    content_type == "video/mp4" and sample[:1] != b"<"
+                                looks_like_mp4 = (
+                                    response.status_code in (200, 206)
+                                    and content_type == "video/mp4"
+                                    and has_ftyp
                                 )
-                                passed = response.status_code in (200, 206) and is_mp4
+                                size_matches = (
+                                    total_size is not None
+                                    and abs(total_size - media.size) <= max(1024 * 1024, int(media.size * 0.02))
+                                )
                                 checks.append({
                                     "resolution": media.resolution,
+                                    "url_field": url_field,
                                     "declared_size_bytes": media.size,
+                                    "actual_total_bytes_from_range": total_size,
+                                    "size_matches_metadata": size_matches,
                                     "cdn_host": urlparse(str(response.url)).hostname,
-                                    "request_profile": profile["name"],
                                     "http_status": response.status_code,
                                     "content_type": content_type,
-                                    "content_range": response.headers.get("content-range"),
-                                    "retry_after": response.headers.get("retry-after"),
-                                    "server": response.headers.get("server"),
+                                    "content_range": content_range or None,
                                     "sample_bytes": len(sample),
                                     "mp4_ftyp_signature": has_ftyp,
-                                    "looks_like_mp4": is_mp4,
-                                    "result": "pass" if passed else "fail",
-                                    "error_body_preview": (
-                                        " ".join(sample[:180].decode("utf-8", errors="replace").split())[:180]
-                                        if not passed and content_type in ("text/html", "text/plain")
-                                        else None
+                                    "looks_like_mp4": looks_like_mp4,
+                                    "result": (
+                                        "pass" if looks_like_mp4 and size_matches else "fail"
+                                    ),
+                                    "note": (
+                                        None if size_matches else
+                                        "MP4 signature alone is insufficient: returned file size differs from API metadata."
                                     ),
                                 })
                         except Exception as check_error:
                             checks.append({
                                 "resolution": media.resolution,
-                                "request_profile": profile["name"],
+                                "url_field": url_field,
                                 "result": "error",
                                 "error_type": type(check_error).__name__,
                                 "message": str(check_error)[:180],
@@ -490,7 +489,7 @@ async def diagnose_moviebox_v3_download():
 
             passed = any(check.get("result") == "pass" for check in checks)
             return {
-                "stage": "v3_cdn_mp4_check",
+                "stage": "v3_cdn_full_resource_validation",
                 "result": "pass" if passed else "fail",
                 "api_version": "v3_signed_native",
                 "title": item.title,
@@ -499,9 +498,9 @@ async def diagnose_moviebox_v3_download():
                 "checks_run": len(checks),
                 "checks": checks,
                 "message": (
-                    "At least one v3 resource URL returned MP4-like bytes."
-                    if passed
-                    else "v3 returned resource URLs, but none passed the MP4 byte check."
+                    "At least one URL returned MP4 bytes with a total size consistent with metadata."
+                    if passed else
+                    "No URL has yet passed both the MP4 signature and metadata-size checks. Compare resourceLink and sourceUrl results."
                 ),
             }
     except Exception as exc:
