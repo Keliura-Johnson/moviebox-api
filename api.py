@@ -260,8 +260,11 @@ async def diagnose_moviebox_download():
                     "GET",
                     media_url,
                     headers={
+                        **__import__(
+                            "moviebox_api.v1.constants",
+                            fromlist=["DOWNLOAD_REQUEST_HEADERS"],
+                        ).DOWNLOAD_REQUEST_HEADERS,
                         "Range": "bytes=0-63",
-                        "User-Agent": "Mozilla/5.0 MovieBox-download-diagnostic",
                     },
                 ) as response:
                     sample = await response.aread()
