@@ -636,3 +636,116 @@ async def diagnose_sintel_full_download():
             "message": str(exc)[:250],
             "elapsed_seconds": round(time.monotonic() - started, 2),
         }
+
+
+@app.get("/api/v1/download/resolve", tags=["downloads"])
+async def resolve_download(
+    title: str = Query(..., min_length=1, max_length=200),
+    year: int | None = Query(default=None, ge=1888, le=2100),
+    resolution: int = Query(default=360, ge=144, le=2160),
+    media_type: str = Query(default="movie", pattern="^(movie|tv)$"),
+    season: int = Query(default=1, ge=1, le=100),
+    episode: int = Query(default=1, ge=1, le=1000),
+):
+    """Resolve a MovieBox v3 movie MP4 URL for immediate client download."""
+    source_dir = str(Path(__file__).resolve().parent / "src")
+    if source_dir not in sys.path:
+        sys.path.insert(0, source_dir)
+
+    clean_title = title.strip()
+    if not clean_title:
+        raise HTTPException(status_code=400, detail="A title is required.")
+
+    try:
+        from moviebox_api.v3.http_client import MovieBoxHttpClient
+        from moviebox_api.v3.core import Search, ItemDetails
+
+        async with MovieBoxHttpClient(timeout=30.0) as client:
+            results = await Search(
+                client_session=client, query=clean_title, per_page=20
+            ).get_content_model()
+            items = [
+                item for item in results.items
+                if getattr(item, "has_resource", False)
+            ]
+            if not items:
+                raise HTTPException(
+                    status_code=404,
+                    detail="No downloadable MovieBox result was found for this title.",
+                )
+
+            def normalized(value):
+                return "".join(ch.lower() for ch in str(value) if ch.isalnum())
+
+            target = normalized(clean_title)
+
+            def score(item):
+                item_title = normalized(getattr(item, "title", ""))
+                exact = item_title == target
+                contains = target in item_title or item_title in target
+                item_year = str(getattr(item, "release_date", "") or "")[:4]
+                year_match = bool(year and item_year == str(year))
+                return (int(exact), int(contains), int(year_match))
+
+            items.sort(key=score, reverse=True)
+            item = items[0]
+
+            if media_type == "tv":
+                raise HTTPException(
+                    status_code=501,
+                    detail=(
+                        "TV episode download lookup is not enabled yet. "
+                        "Test movie downloads first; episode-specific MovieBox "
+                        "v3 lookup needs verification."
+                    ),
+                )
+
+            details = await ItemDetails(
+                client_session=client
+            ).get_content_model(item.subject_id)
+            options = [
+                option
+                for detector in (details.resource_detectors or [])
+                for option in (detector.resolution_list or [])
+                if getattr(option, "resource_link", None)
+            ]
+            if not options:
+                raise HTTPException(
+                    status_code=404,
+                    detail="MovieBox returned no downloadable video resources.",
+                )
+
+            def get_resolution(option):
+                try:
+                    return int(option.resolution)
+                except (TypeError, ValueError):
+                    return 0
+
+            options.sort(key=get_resolution)
+            eligible = [o for o in options if get_resolution(o) <= resolution]
+            chosen = eligible[-1] if eligible else options[0]
+            download_url = str(chosen.resource_link)
+            parsed = urlparse(download_url)
+            if parsed.scheme != "https" or not parsed.hostname:
+                raise HTTPException(
+                    status_code=502,
+                    detail="MovieBox returned an invalid download URL.",
+                )
+
+            return {
+                "result": "ok",
+                "title": str(getattr(details, "title", None) or item.title),
+                "subject_id": str(item.subject_id),
+                "media_type": media_type,
+                "resolution": get_resolution(chosen),
+                "size_bytes": getattr(chosen, "size", None),
+                "download_url": download_url,
+                "url_expires_note": "Start downloading promptly; the source URL may expire.",
+            }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"MovieBox download resolution failed ({type(exc).__name__}).",
+        ) from exc
