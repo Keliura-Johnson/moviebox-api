@@ -359,11 +359,10 @@ async def diagnose_moviebox_download():
 
 @app.get("/api/v1/diagnostics/moviebox-v3-download", tags=["diagnostics"])
 async def diagnose_moviebox_v3_download():
-    """Tests each requested resolution and checks the resulting CDN object size."""
+    """Inspect item-detail resource detectors and compare candidate MP4 sizes."""
     import sys
-    from pathlib import Path
     import hashlib
-    from moviebox_api.v3.constants import ResolutionType
+    from pathlib import Path
 
     source_dir = str(Path(__file__).resolve().parent / "src")
     if source_dir not in sys.path:
@@ -371,7 +370,8 @@ async def diagnose_moviebox_v3_download():
 
     try:
         from moviebox_api.v3.http_client import MovieBoxHttpClient
-        from moviebox_api.v3.core import Search, DownloadableVideoFilesDetail
+        from moviebox_api.v3.core import Search, ItemDetails, DownloadableVideoFilesDetail
+        from moviebox_api.v3.constants import ResolutionType
 
         async with MovieBoxHttpClient(timeout=25.0) as client:
             search = Search(client_session=client, query="Sintel", per_page=10)
@@ -381,103 +381,128 @@ async def diagnose_moviebox_v3_download():
                 if "sintel" in item.title.lower() and item.has_resource
             ]
             if not candidates:
-                return {
-                    "stage": "v3_search",
-                    "result": "no_match",
-                    "returned_titles": [
-                        {"title": item.title, "has_resource": item.has_resource}
-                        for item in results.items[:10]
-                    ],
-                }
+                return {"stage": "v3_search", "result": "no_match"}
 
             item = candidates[0]
-            all_checks = []
-            async with httpx.AsyncClient(follow_redirects=True, timeout=25.0) as media_client:
-                for resolution in (ResolutionType._360P, ResolutionType._720P, ResolutionType._1080P):
-                    downloader = DownloadableVideoFilesDetail(
-                        client_session=client,
-                        per_page=10,
-                        resolution=resolution,
-                    )
-                    metadata = await downloader.get_content_model(
-                        subject_id=item.subject_id,
-                        release_date=str(item.release_date),
-                    )
-                    option_checks = []
-                    for media in metadata.list[:4]:
-                        media_url = str(media.resource_link)
-                        parsed = urlparse(media_url)
-                        url_fingerprint = hashlib.sha256(media_url.encode()).hexdigest()[:12]
-                        check = {
-                            "requested_resolution": int(resolution),
-                            "returned_resolution": media.resolution,
-                            "declared_size_bytes": media.size,
-                            "url_fingerprint": url_fingerprint,
-                            "url_host": parsed.hostname,
-                        }
-                        try:
-                            async with media_client.stream(
-                                "GET",
-                                media_url,
-                                headers={
-                                    "User-Agent": (
-                                        "com.community.oneroom/50020044 (Linux; U; Android 13; "
-                                        "en_US; 23078RKD5C; Build/TQ2A.230405.003; Cronet/135.0.7012.3)"
-                                    ),
-                                    "Accept": "video/mp4,video/*;q=0.9,*/*;q=0.8",
-                                    "Range": "bytes=0-1023",
-                                },
-                            ) as response:
-                                sample = await response.aread()
-                                content_type = response.headers.get("content-type", "unknown").split(";")[0].lower()
-                                content_range = response.headers.get("content-range", "")
-                                total_size = None
-                                if "/" in content_range:
-                                    try:
-                                        total_size = int(content_range.rsplit("/", 1)[1])
-                                    except ValueError:
-                                        pass
-                                has_ftyp = len(sample) >= 8 and sample[4:8] == b"ftyp"
-                                size_matches = (
-                                    total_size is not None
-                                    and abs(total_size - media.size) <= max(1024 * 1024, int(media.size * 0.02))
-                                )
-                                check.update({
-                                    "final_cdn_host": urlparse(str(response.url)).hostname,
-                                    "http_status": response.status_code,
-                                    "content_type": content_type,
-                                    "content_range": content_range or None,
-                                    "sample_bytes": len(sample),
-                                    "mp4_ftyp_signature": has_ftyp,
-                                    "actual_total_bytes": total_size,
-                                    "size_matches_metadata": size_matches,
-                                    "result": "pass" if response.status_code in (200, 206) and content_type == "video/mp4" and has_ftyp and size_matches else "fail",
-                                })
-                        except Exception as exc:
-                            check.update({"result": "error", "error_type": type(exc).__name__, "message": str(exc)[:180]})
-                        option_checks.append(check)
-                    all_checks.append({
-                        "requested_resolution": int(resolution),
-                        "resource_options_returned": len(metadata.list),
-                        "options": option_checks,
+            details = await ItemDetails(client_session=client).get_content_model(item.subject_id)
+            candidates_to_check = []
+            detector_summary = []
+            for index, detector in enumerate(details.resource_detectors or []):
+                summary = {
+                    "index": index,
+                    "source": detector.source,
+                    "type": detector.type,
+                    "first_size_bytes": detector.first_size,
+                    "download_url_host": urlparse(str(detector.download_url)).hostname if detector.download_url else None,
+                    "resolution_list": [],
+                }
+                if detector.download_url:
+                    candidates_to_check.append({
+                        "origin": "detail.downloadUrl",
+                        "resolution": None,
+                        "declared_size_bytes": detector.first_size or None,
+                        "url": str(detector.download_url),
+                        "detector_index": index,
+                    })
+                for option in detector.resolution_list or []:
+                    summary["resolution_list"].append({
+                        "resolution": int(option.resolution),
+                        "size_bytes": option.size,
+                        "host": urlparse(str(option.resource_link)).hostname,
+                    })
+                    candidates_to_check.append({
+                        "origin": "detail.resolutionList",
+                        "resolution": int(option.resolution),
+                        "declared_size_bytes": option.size or None,
+                        "url": str(option.resource_link),
+                        "detector_index": index,
+                    })
+                detector_summary.append(summary)
+
+            for resolution in (ResolutionType._360P, ResolutionType._720P, ResolutionType._1080P):
+                metadata = await DownloadableVideoFilesDetail(
+                    client_session=client, per_page=10, resolution=resolution
+                ).get_content_model(item.subject_id, release_date=str(item.release_date))
+                for media in metadata.list:
+                    candidates_to_check.append({
+                        "origin": "resource_endpoint",
+                        "resolution": media.resolution,
+                        "declared_size_bytes": media.size or None,
+                        "url": str(media.resource_link),
+                        "detector_index": None,
                     })
 
-            passed = any(
-                option.get("result") == "pass"
-                for group in all_checks for option in group["options"]
-            )
+            checks = []
+            seen = set()
+            async with httpx.AsyncClient(follow_redirects=True, timeout=25.0) as media_client:
+                for candidate in candidates_to_check:
+                    url = candidate["url"]
+                    fingerprint = hashlib.sha256(url.encode()).hexdigest()[:12]
+                    if fingerprint in seen:
+                        continue
+                    seen.add(fingerprint)
+                    parsed = urlparse(url)
+                    check = {
+                        "origin": candidate["origin"],
+                        "resolution": candidate["resolution"],
+                        "declared_size_bytes": candidate["declared_size_bytes"],
+                        "url_fingerprint": fingerprint,
+                        "url_host": parsed.hostname,
+                        "detector_index": candidate["detector_index"],
+                    }
+                    if parsed.scheme != "https" or not parsed.hostname:
+                        check["result"] = "invalid_url"
+                        checks.append(check)
+                        continue
+                    try:
+                        async with media_client.stream(
+                            "GET", url,
+                            headers={
+                                "User-Agent": "com.community.oneroom/50020044 (Linux; U; Android 13; en_US; 23078RKD5C; Build/TQ2A.230405.003; Cronet/135.0.7012.3)",
+                                "Accept": "video/mp4,video/*;q=0.9,*/*;q=0.8",
+                                "Range": "bytes=0-1023",
+                            },
+                        ) as response:
+                            sample = await response.aread()
+                            content_type = response.headers.get("content-type", "unknown").split(";")[0].lower()
+                            content_range = response.headers.get("content-range", "")
+                            total_size = None
+                            if "/" in content_range:
+                                try:
+                                    total_size = int(content_range.rsplit("/", 1)[1])
+                                except ValueError:
+                                    pass
+                            has_ftyp = len(sample) >= 8 and sample[4:8] == b"ftyp"
+                            declared = candidate["declared_size_bytes"]
+                            size_matches = bool(
+                                declared and total_size is not None and
+                                abs(total_size - declared) <= max(1024 * 1024, int(declared * 0.02))
+                            )
+                            check.update({
+                                "final_cdn_host": urlparse(str(response.url)).hostname,
+                                "http_status": response.status_code,
+                                "content_type": content_type,
+                                "content_range": content_range or None,
+                                "sample_bytes": len(sample),
+                                "mp4_ftyp_signature": has_ftyp,
+                                "actual_total_bytes": total_size,
+                                "size_matches_metadata": size_matches if declared else None,
+                                "result": "pass" if response.status_code in (200, 206) and content_type == "video/mp4" and has_ftyp and (size_matches or not declared) else "fail",
+                            })
+                    except Exception as exc:
+                        check.update({"result": "error", "error_type": type(exc).__name__, "message": str(exc)[:180]})
+                    checks.append(check)
+
+            passed = any(check.get("result") == "pass" for check in checks)
             return {
-                "stage": "v3_resolution_selection",
+                "stage": "v3_detail_resource_inspection",
                 "result": "pass" if passed else "fail",
-                "title": item.title,
+                "title": details.title,
                 "subject_id": item.subject_id,
-                "resolution_tests": all_checks,
-                "message": "Found at least one MP4 whose actual size matches its metadata." if passed else "No selected resolution passed the full MP4 size check. Compare URL fingerprints and returned resolutions to diagnose selection behavior.",
+                "resource_detectors": detector_summary,
+                "unique_urls_tested": len(checks),
+                "checks": checks,
+                "message": "At least one detail or resource URL passed MP4 validation." if passed else "No tested detail/resource URL passed; use detector summaries to identify alternate hosts and metadata.",
             }
     except Exception as exc:
-        return {
-            "stage": "v3_exception",
-            "result": "error",
-            "error_type": type(exc).__name__,
-            "message": str(exc)[:400],
-        }
+        return {"stage": "v3_exception", "result": "error", "error_type": type(exc).__name__, "message": str(exc)[:400]}
