@@ -1047,7 +1047,7 @@ async def verify_episode_video_url(url, expected_size=None):
         return False, f"{type(exc).__name__}:{str(exc)[:150]}"
 
 
-async def get_verified_tv_episode_v2(title, year, season, episode):
+async def get_tv_episode_candidates_v2(title, year, season, episode):
     from moviebox_api.v2.requests import Session
     from moviebox_api.v2.download import DownloadableTVSeriesFilesDetail
 
@@ -1081,18 +1081,28 @@ async def get_verified_tv_episode_v2(title, year, season, episode):
             if not url or resolution <= 0 or size <= 0:
                 continue
 
-            valid, _ = await verify_episode_video_url(url, size)
+            parsed = urlparse(url)
 
-            if valid:
-                resources.append({
-                    "resolution": resolution,
-                    "size": size,
-                    "resource_link": url,
-                    "title": f"Episode #{season}.{episode}",
-                    "season": season,
-                    "episode": episode,
-                    "api_version": "v2",
-                })
+            if (
+                parsed.scheme != "https"
+                or not parsed.hostname
+                or parsed.username
+                or parsed.password
+                or is_placeholder_resource(url)
+            ):
+                continue
+
+            resources.append({
+                "resolution": resolution,
+                "size": size,
+                "resource_link": url,
+                "title": f"Episode #{season}.{episode}",
+                "season": season,
+                "episode": episode,
+                "api_version": "v2",
+                "url_verified": False,
+                "verification": "metadata_only",
+            })
 
         return {
             "title": str(getattr(item, "title", None) or title),
@@ -1297,6 +1307,8 @@ async def collect_v3_tv_episode(title, year, season, episode):
                                 "season": int(season),
                                 "episode": int(episode),
                                 "api_version": "v3",
+                                "url_verified": True,
+                                "verification": "render_mp4_probe_passed",
                             })
 
     except Exception as exc:
@@ -1305,13 +1317,13 @@ async def collect_v3_tv_episode(title, year, season, episode):
     return result
 
 
-async def get_verified_tv_episode(title, year, season, episode):
+async def get_tv_episode_candidates(title, year, season, episode):
     v3 = await collect_v3_tv_episode(
         title, year, season, episode
     )
 
     try:
-        v2 = await get_verified_tv_episode_v2(
+        v2 = await get_tv_episode_candidates_v2(
             title, year, season, episode
         )
 
@@ -1335,9 +1347,17 @@ async def get_verified_tv_episode(title, year, season, episode):
     for version, data in (("v3", v3), ("v2", v2_data)):
         for entry in data.get("resources", []):
             resource = {**entry, "api_version": version}
-            combined[
-                (resource["resolution"], resource["resource_link"])
-            ] = resource
+            key = (resource["resolution"], resource["resource_link"])
+            existing = combined.get(key)
+
+            if (
+                existing is None
+                or (
+                    resource.get("url_verified")
+                    and not existing.get("url_verified")
+                )
+            ):
+                combined[key] = resource
 
     resources = sorted(
         combined.values(),
@@ -1370,9 +1390,19 @@ async def get_verified_tv_episode(title, year, season, episode):
             },
             "v2": {
                 "subject_id": v2_data.get("subject_id"),
+                "available_qualities": sorted({
+                    entry["resolution"]
+                    for entry in v2_data.get("resources", [])
+                }),
                 "verified_qualities": sorted({
                     entry["resolution"]
                     for entry in v2_data.get("resources", [])
+                    if entry.get("url_verified")
+                }),
+                "metadata_only_qualities": sorted({
+                    entry["resolution"]
+                    for entry in v2_data.get("resources", [])
+                    if not entry.get("url_verified")
                 }),
                 "error": v2_data.get("error"),
             },
@@ -1392,7 +1422,7 @@ async def get_download_qualities(
 
     try:
         if media_type == "tv":
-            data = await get_verified_tv_episode(
+            data = await get_tv_episode_candidates(
                 title, year, season, episode
             )
 
@@ -1404,9 +1434,9 @@ async def get_download_qualities(
             if not qualities:
                 raise HTTPException(
                     404,
-                    "No verified episode resources were found. "
-                    "Use /api/v1/diagnostics/tv-episode-v1-metadata "
-                    "to inspect the upstream V1 error.",
+                    "No episode resource candidates were found. "
+                    "Inspect /api/v1/diagnostics/tv-episode-versions "
+                    "for the upstream results.",
                 )
 
             return {
@@ -1477,7 +1507,7 @@ async def resolve_download(
 
     try:
         if media_type == "tv":
-            data = await get_verified_tv_episode(
+            data = await get_tv_episode_candidates(
                 title, year, season, episode
             )
 
@@ -1486,8 +1516,8 @@ async def resolve_download(
             if not resources:
                 raise HTTPException(
                     404,
-                    "No verified episode resource was found. "
-                    "Inspect /api/v1/diagnostics/tv-episode-v1-metadata.",
+                    "No episode resource candidates were found. "
+                    "Inspect /api/v1/diagnostics/tv-episode-versions.",
                 )
 
             eligible = [
@@ -1512,8 +1542,18 @@ async def resolve_download(
                 "size_bytes": chosen["size"],
                 "download_url": chosen["resource_link"],
                 "api_version": chosen.get("api_version"),
+                "url_verified": bool(chosen.get("url_verified", False)),
+                "verification": chosen.get("verification", "metadata_only"),
                 "url_expires_note": (
-                    "Start downloading promptly; the source URL may expire."
+                    "Render verified this MP4 response; start downloading promptly."
+                    if chosen.get("url_verified")
+                    else (
+                        "MovieBox returned this episode URL and file-size metadata, "
+                        "but Render could not verify the media response. The URL is "
+                        "being returned as an unverified candidate for the Kevi "
+                        "device to test. It may expire, and download success is "
+                        "not yet confirmed."
+                    )
                 ),
             }
 
@@ -1587,7 +1627,7 @@ async def diagnose_tv_episode_versions(
 ):
     setup_source_path()
 
-    data = await get_verified_tv_episode(
+    data = await get_tv_episode_candidates(
         title, year, season, episode
     )
 
@@ -1598,14 +1638,25 @@ async def diagnose_tv_episode_versions(
         if versions[version].get("verified_qualities")
     ]
 
+    candidates = [
+        version for version in ("v3", "v2")
+        if (
+            versions[version].get("verified_qualities")
+            or versions[version].get("metadata_only_qualities")
+            or versions[version].get("available_qualities")
+        )
+    ]
+
     return {
         "result": (
             "verified_episode_found" if found
-            else "no_verified_episode"
+            else "episode_metadata_candidates_found" if candidates
+            else "no_episode_candidates"
         ),
         "title": data["title"],
         "season": season,
         "episode": episode,
         "versions_with_verified_resources": found,
+        "versions_with_episode_candidates": candidates,
         "versions": versions,
     }
