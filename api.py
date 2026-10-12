@@ -320,50 +320,87 @@ def get_movie_options(details):
 
 
 async def find_moviebox_v2_series_item(session, title, year=None):
+    """Find a TV-series search item without validating unrelated API fields."""
     from moviebox_api.v2.constants import SubjectType
     from moviebox_api.v2.core import Search
+    from moviebox_api.v2.models import SearchResultsItem
 
     clean_title = str(title or "").strip()
     if not clean_title:
         raise HTTPException(400, "A title is required.")
 
-    results = await Search(
+    search = Search(
         session=session,
         query=clean_title,
         subject_type=SubjectType.TV_SERIES,
         page=1,
         per_page=20,
-    ).get_content_model()
+    )
 
-    items = list(getattr(results, "items", []) or [])
-    if not items:
+    # Use the raw response here. MovieBox sometimes returns search fields that
+    # don't match every field required by the library's Pydantic model. The
+    # downloader only needs subjectId, detailPath and subjectType, so validating
+    # unrelated response fields can incorrectly stop episode lookup.
+    raw_results = await search.get_content()
+    raw_items = raw_results.get("items", []) if isinstance(raw_results, dict) else []
+    if not isinstance(raw_items, list) or not raw_items:
         raise HTTPException(
             404,
             "MovieBox v2 returned no TV-series search results for this title.",
         )
 
     target = normalize_title(clean_title)
+    candidates = []
+    for raw_item in raw_items:
+        if not isinstance(raw_item, dict):
+            continue
 
-    def score(item):
-        item_title = normalize_title(getattr(item, "title", ""))
-        item_year = str(getattr(item, "releaseDate", "") or "")[:4]
-        return (
-            int(item_title == target),
-            int(bool(target) and (target in item_title or item_title in target)),
-            int(bool(year) and item_year == str(year)),
+        item_title = str(raw_item.get("title") or "")
+        normalized = normalize_title(item_title)
+        if not normalized or not (normalized == target or target in normalized or normalized in target):
+            continue
+
+        subject_type = raw_item.get("subjectType", SubjectType.TV_SERIES.value)
+        try:
+            if int(getattr(subject_type, "value", subject_type)) != SubjectType.TV_SERIES.value:
+                continue
+        except (TypeError, ValueError):
+            continue
+
+        subject_id = raw_item.get("subjectId") or raw_item.get("subject_id")
+        detail_path = raw_item.get("detailPath") or raw_item.get("detail_path")
+        if not subject_id or not detail_path:
+            continue
+
+        release_date = str(
+            raw_item.get("releaseDate") or raw_item.get("release_date") or ""
+        )[:4]
+        score = (
+            int(normalized == target),
+            int(bool(year) and release_date == str(year)),
+            int(target in normalized or normalized in target),
         )
+        candidates.append((score, raw_item))
 
-    items.sort(key=score, reverse=True)
-    best = items[0]
-    best_title = normalize_title(getattr(best, "title", ""))
-
-    if target and target not in best_title and best_title not in target:
+    if not candidates:
         raise HTTPException(
             404,
-            "No sufficiently matching TV series was found in MovieBox v2.",
+            "MovieBox v2 did not return a matching TV series with the identifiers needed to look up episodes.",
         )
 
-    return best
+    candidates.sort(key=lambda row: row[0], reverse=True)
+    best = candidates[0][1]
+
+    # Build the library's expected type with only the fields the downloader
+    # actually consumes. model_construct avoids failures on unrelated optional
+    # or newly changed upstream fields.
+    item = SearchResultsItem.model_construct(
+        subjectId=str(best.get("subjectId") or best.get("subject_id")),
+        subjectType=SubjectType.TV_SERIES,
+        title=str(best.get("title") or clean_title),
+        detailPath=str(best.get("detailPath") or best.get("detail_path")),
+    )
+    return item
 
 
 async def verify_episode_video_url(url, expected_size=None):
@@ -472,7 +509,7 @@ async def verify_episode_video_url(url, expected_size=None):
 
 
 async def get_episode_resources(session, item, season, episode):
-    """Fetch and verify actual downloadable files for one TV episode via v2."""
+    """Fetch and verify raw downloadable records for one TV episode via v2."""
     from moviebox_api.v2.download import DownloadableTVSeriesFilesDetail
 
     if season < 1 or episode < 1:
@@ -480,20 +517,43 @@ async def get_episode_resources(session, item, season, episode):
             400, "Season and episode must be positive numbers."
         )
 
-    metadata = await DownloadableTVSeriesFilesDetail(
+    downloader = DownloadableTVSeriesFilesDetail(
         session=session,
         item=item,
-    ).get_content_model(int(season), int(episode))
+    )
+
+    # Parse only the fields we use. get_content_model() validates the complete
+    # response against a strict schema, and can fail when MovieBox omits or
+    # changes unrelated metadata such as captions/flags.
+    raw_metadata = await downloader.get_content(int(season), int(episode))
+    if not isinstance(raw_metadata, dict):
+        raise HTTPException(
+            502, "MovieBox returned an unexpected episode-resource response."
+        )
+
+    downloads = raw_metadata.get("downloads") or []
+    if not isinstance(downloads, list):
+        raise HTTPException(
+            502, "MovieBox returned an invalid episode downloads list."
+        )
 
     found = []
-    for media_file in (getattr(metadata, "downloads", None) or []):
-        url = str(getattr(media_file, "url", "") or "")
+    for media_file in downloads:
+        if not isinstance(media_file, dict):
+            continue
+
+        url = str(
+            media_file.get("url")
+            or media_file.get("resource_link")
+            or media_file.get("resourceLink")
+            or ""
+        ).strip()
         if not url:
             continue
 
         try:
-            resolution = int(getattr(media_file, "resolution", 0) or 0)
-            size = int(getattr(media_file, "size", 0) or 0)
+            resolution = int(media_file.get("resolution") or 0)
+            size = int(media_file.get("size") or 0)
         except (TypeError, ValueError):
             continue
 
@@ -511,7 +571,7 @@ async def get_episode_resources(session, item, season, episode):
             "title": f"Episode #{season}.{episode}",
             "season": int(season),
             "episode": int(episode),
-            "resource_id": str(getattr(media_file, "id", "") or ""),
+            "resource_id": str(media_file.get("id") or ""),
         })
 
     unique = {}
@@ -626,7 +686,7 @@ async def get_download_qualities(
     except Exception as exc:
         raise HTTPException(
             502,
-            f"MovieBox quality lookup failed ({type(exc).__name__}).",
+            f"MovieBox quality lookup failed ({type(exc).__name__}): {str(exc)[:900]}",
         ) from exc
 
 
@@ -737,7 +797,7 @@ async def resolve_download(
     except Exception as exc:
         raise HTTPException(
             502,
-            f"MovieBox download resolution failed ({type(exc).__name__}).",
+            f"MovieBox download resolution failed ({type(exc).__name__}): {str(exc)[:900]}",
         ) from exc
 
 
