@@ -249,6 +249,26 @@ async def diagnose_moviebox_download():
                 "Range": "bytes=0-63",
             }
             checks = []
+            # Test both the package's documented desktop headers and an Android
+            # app-style media request. Some CDN mirrors treat these differently.
+            header_profiles = [
+                {
+                    "profile": "package_firefox",
+                    "headers": request_headers,
+                },
+                {
+                    "profile": "android_media",
+                    "headers": {
+                        "Accept": "video/mp4,video/*;q=0.9,*/*;q=0.8",
+                        "User-Agent": (
+                            "com.community.oneroom/50020044 (Linux; U; Android 13; "
+                            "en_US; 23078RKD5C; Build/TQ2A.230405.003; Cronet/135.0.7012.3)"
+                        ),
+                        "Referer": "https://www.movieboxpro.app/",
+                        "Range": "bytes=0-63",
+                    },
+                },
+            ]
             async with httpx.AsyncClient(
                 follow_redirects=True, timeout=20.0
             ) as client:
@@ -261,57 +281,58 @@ async def diagnose_moviebox_download():
                             "result": "invalid_url",
                         })
                         continue
-                    try:
-                        async with client.stream(
-                            "GET", media_url, headers=request_headers
-                        ) as response:
-                            sample = await response.aread()
-                            content_type = response.headers.get(
-                                "content-type", "unknown"
-                            ).split(";")[0].lower()
-                            has_ftyp = len(sample) >= 8 and sample[4:8] == b"ftyp"
-                            is_mp4 = has_ftyp or (
-                                content_type == "video/mp4" and sample[:1] != b"<"
-                            )
-                            passed = response.status_code in (200, 206) and is_mp4
-                            # Return safe diagnostics for blocked responses so we can
-                            # distinguish rate limits from an invalid/expired media URL.
-                            diagnostic_headers = {
-                                key: response.headers.get(key)
-                                for key in (
-                                    "retry-after", "server", "via",
-                                    "content-length", "content-type",
-                                    "location", "cf-ray"
+                    for profile in header_profiles:
+                        try:
+                            async with client.stream(
+                                "GET", media_url, headers=profile["headers"]
+                            ) as response:
+                                sample = await response.aread()
+                                content_type = response.headers.get(
+                                    "content-type", "unknown"
+                                ).split(";")[0].lower()
+                                has_ftyp = len(sample) >= 8 and sample[4:8] == b"ftyp"
+                                is_mp4 = has_ftyp or (
+                                    content_type == "video/mp4" and sample[:1] != b"<"
                                 )
-                                if response.headers.get(key) is not None
-                            }
-                            body_preview = ""
-                            if not passed:
-                                body_preview = sample[:400].decode(
-                                    "utf-8", errors="replace"
-                                )
-                                body_preview = " ".join(body_preview.split())[:400]
+                                passed = response.status_code in (200, 206) and is_mp4
+                                diagnostic_headers = {
+                                    key: response.headers.get(key)
+                                    for key in (
+                                        "retry-after", "server", "via",
+                                        "content-length", "content-type",
+                                        "location", "cf-ray"
+                                    )
+                                    if response.headers.get(key) is not None
+                                }
+                                body_preview = ""
+                                if not passed:
+                                    body_preview = sample[:400].decode(
+                                        "utf-8", errors="replace"
+                                    )
+                                    body_preview = " ".join(body_preview.split())[:400]
+                                checks.append({
+                                    "resolution": media.resolution,
+                                    "request_profile": profile["profile"],
+                                    "extension": media.ext,
+                                    "declared_size_bytes": media.size,
+                                    "http_status": response.status_code,
+                                    "final_host": urlparse(str(response.url)).hostname,
+                                    "content_type": content_type,
+                                    "response_headers": diagnostic_headers,
+                                    "error_body_preview": body_preview or None,
+                                    "sample_bytes": len(sample),
+                                    "mp4_ftyp_signature": has_ftyp,
+                                    "looks_like_mp4": is_mp4,
+                                    "result": "pass" if passed else "fail",
+                                })
+                        except Exception as check_error:
                             checks.append({
                                 "resolution": media.resolution,
-                                "extension": media.ext,
-                                "declared_size_bytes": media.size,
-                                "http_status": response.status_code,
-                                "final_host": urlparse(str(response.url)).hostname,
-                                "content_type": content_type,
-                                "response_headers": diagnostic_headers,
-                                "error_body_preview": body_preview or None,
-                                "sample_bytes": len(sample),
-                                "mp4_ftyp_signature": has_ftyp,
-                                "looks_like_mp4": is_mp4,
-                                "result": "pass" if passed else "fail",
+                                "request_profile": profile["profile"],
+                                "result": "error",
+                                "error_type": type(check_error).__name__,
+                                "message": str(check_error)[:200],
                             })
-                    except Exception as check_error:
-                        checks.append({
-                            "resolution": media.resolution,
-                            "result": "error",
-                            "error_type": type(check_error).__name__,
-                            "message": str(check_error)[:200],
-                        })
 
             passed = any(check.get("result") == "pass" for check in checks)
             return {
