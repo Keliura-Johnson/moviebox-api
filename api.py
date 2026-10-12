@@ -355,3 +355,159 @@ async def diagnose_moviebox_download():
             "message": str(exc)[:500],
         }
 
+
+
+@app.get("/api/v1/diagnostics/moviebox-v3-download", tags=["diagnostics"])
+async def diagnose_moviebox_v3_download():
+    """
+    Independently tests v3's signed native API resource lookup and checks
+    whether its returned CDN URLs serve MP4 bytes. Does not return media URLs.
+    """
+    import sys
+    from pathlib import Path
+
+    source_dir = str(Path(__file__).resolve().parent / "src")
+    if source_dir not in sys.path:
+        sys.path.insert(0, source_dir)
+
+    try:
+        from moviebox_api.v3.http_client import MovieBoxHttpClient
+        from moviebox_api.v3.core import Search, DownloadableVideoFilesDetail
+        from moviebox_api.v3.constants import CustomResolutionType
+
+        async with MovieBoxHttpClient(timeout=25.0) as client:
+            search = Search(client_session=client, query="Sintel", per_page=10)
+            results = await search.get_content_model()
+            candidates = [
+                item for item in results.items
+                if "sintel" in item.title.lower() and item.has_resource
+            ]
+            if not candidates:
+                return {
+                    "stage": "v3_search",
+                    "result": "no_match",
+                    "returned_titles": [
+                        {"title": item.title, "has_resource": item.has_resource}
+                        for item in results.items[:10]
+                    ],
+                    "message": "v3 signed search worked, but no matching item with resources was found.",
+                }
+
+            item = candidates[0]
+            downloader = DownloadableVideoFilesDetail(
+                client_session=client,
+                per_page=10,
+                resolution=CustomResolutionType.BEST,
+            )
+            metadata = await downloader.get_content_model(
+                subject_id=item.subject_id,
+                release_date=str(item.release_date),
+            )
+            if not metadata.list:
+                return {
+                    "stage": "v3_resource_metadata",
+                    "result": "no_downloads",
+                    "title": item.title,
+                    "subject_id": item.subject_id,
+                    "message": "v3 found the title, but the resource endpoint returned no files.",
+                }
+
+            checks = []
+            async with httpx.AsyncClient(follow_redirects=True, timeout=25.0) as media_client:
+                for media in metadata.list[:6]:
+                    media_url = str(media.resource_link)
+                    parsed = urlparse(media_url)
+                    if parsed.scheme != "https" or not parsed.hostname:
+                        checks.append({
+                            "resolution": media.resolution,
+                            "result": "invalid_url",
+                        })
+                        continue
+
+                    profiles = [
+                        {
+                            "name": "android_app",
+                            "headers": {
+                                "User-Agent": (
+                                    "com.community.oneroom/50020044 (Linux; U; Android 13; "
+                                    "en_US; 23078RKD5C; Build/TQ2A.230405.003; Cronet/135.0.7012.3)"
+                                ),
+                                "Accept": "video/mp4,video/*;q=0.9,*/*;q=0.8",
+                                "Range": "bytes=0-63",
+                            },
+                        },
+                        {
+                            "name": "generic_media",
+                            "headers": {
+                                "User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36",
+                                "Accept": "*/*",
+                                "Range": "bytes=0-63",
+                            },
+                        },
+                    ]
+                    for profile in profiles:
+                        try:
+                            async with media_client.stream(
+                                "GET", media_url, headers=profile["headers"]
+                            ) as response:
+                                sample = await response.aread()
+                                content_type = response.headers.get(
+                                    "content-type", "unknown"
+                                ).split(";")[0].lower()
+                                has_ftyp = len(sample) >= 8 and sample[4:8] == b"ftyp"
+                                is_mp4 = has_ftyp or (
+                                    content_type == "video/mp4" and sample[:1] != b"<"
+                                )
+                                passed = response.status_code in (200, 206) and is_mp4
+                                checks.append({
+                                    "resolution": media.resolution,
+                                    "declared_size_bytes": media.size,
+                                    "cdn_host": urlparse(str(response.url)).hostname,
+                                    "request_profile": profile["name"],
+                                    "http_status": response.status_code,
+                                    "content_type": content_type,
+                                    "content_range": response.headers.get("content-range"),
+                                    "retry_after": response.headers.get("retry-after"),
+                                    "server": response.headers.get("server"),
+                                    "sample_bytes": len(sample),
+                                    "mp4_ftyp_signature": has_ftyp,
+                                    "looks_like_mp4": is_mp4,
+                                    "result": "pass" if passed else "fail",
+                                    "error_body_preview": (
+                                        " ".join(sample[:180].decode("utf-8", errors="replace").split())[:180]
+                                        if not passed and content_type in ("text/html", "text/plain")
+                                        else None
+                                    ),
+                                })
+                        except Exception as check_error:
+                            checks.append({
+                                "resolution": media.resolution,
+                                "request_profile": profile["name"],
+                                "result": "error",
+                                "error_type": type(check_error).__name__,
+                                "message": str(check_error)[:180],
+                            })
+
+            passed = any(check.get("result") == "pass" for check in checks)
+            return {
+                "stage": "v3_cdn_mp4_check",
+                "result": "pass" if passed else "fail",
+                "api_version": "v3_signed_native",
+                "title": item.title,
+                "subject_id": item.subject_id,
+                "resource_options_found": len(metadata.list),
+                "checks_run": len(checks),
+                "checks": checks,
+                "message": (
+                    "At least one v3 resource URL returned MP4-like bytes."
+                    if passed
+                    else "v3 returned resource URLs, but none passed the MP4 byte check."
+                ),
+            }
+    except Exception as exc:
+        return {
+            "stage": "v3_exception",
+            "result": "error",
+            "error_type": type(exc).__name__,
+            "message": str(exc)[:400],
+        }
