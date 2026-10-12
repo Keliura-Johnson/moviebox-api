@@ -198,7 +198,8 @@ async def diagnose_moviebox_download():
         from moviebox_api.v2.download import DownloadableMovieFilesDetail
         from moviebox_api.v2.requests import Session
 
-        async with Session(timeout=20.0) as session:
+        session = Session(timeout=20.0)
+        async with session._client:
             search = Search(session=session, query="Big Buck Bunny", per_page=10)
             results = await search.get_content_model()
 
