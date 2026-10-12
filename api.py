@@ -217,9 +217,20 @@ async def diagnose_moviebox_download():
                 }
 
             item = candidates[0]
-            metadata = await DownloadableMovieFilesDetail(
-                session=session, item=item
-            ).get_content_model()
+            from moviebox_api.v1.models import DownloadableFilesMetadata
+
+            downloader = DownloadableMovieFilesDetail(session=session, item=item)
+            raw_metadata = await downloader.get_content()
+            raw_downloads = raw_metadata.get("downloads") or []
+            valid_downloads = [
+                entry for entry in raw_downloads
+                if isinstance(entry, dict)
+                and isinstance(entry.get("url"), str)
+                and entry["url"].strip()
+            ]
+            metadata = DownloadableFilesMetadata(
+                **{**raw_metadata, "downloads": valid_downloads}
+            )
 
             if not metadata.downloads:
                 return {
