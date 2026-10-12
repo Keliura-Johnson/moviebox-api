@@ -179,3 +179,116 @@ async def demo_player():
 </html>""",
         headers={"Cache-Control": "no-store"},
     )
+
+@app.get("/api/v1/diagnostics/moviebox-download", tags=["diagnostics"])
+async def diagnose_moviebox_download():
+    """
+    Tests the repository's real MovieBox search/download functions against the
+    public-domain short film Big Buck Bunny. URLs are deliberately not returned.
+    """
+    import sys
+    from pathlib import Path
+
+    source_dir = str(Path(__file__).resolve().parent / "src")
+    if source_dir not in sys.path:
+        sys.path.insert(0, source_dir)
+
+    try:
+        from moviebox_api.v2.core import Search
+        from moviebox_api.v2.download import DownloadableMovieFilesDetail
+        from moviebox_api.v2.requests import Session
+
+        async with Session(timeout=20.0) as session:
+            search = Search(session=session, query="Big Buck Bunny", per_page=10)
+            results = await search.get_content_model()
+
+            candidates = [
+                item for item in results.items
+                if "big buck bunny" in item.title.lower()
+                and str(item.subjectType).lower() in ("movies", "subjecttype.movies", "1")
+            ]
+            if not candidates:
+                return {
+                    "stage": "search",
+                    "result": "no_match",
+                    "query": "Big Buck Bunny",
+                    "returned_titles": [item.title for item in results.items[:10]],
+                    "message": "MovieBox search worked, but returned no matching movie.",
+                }
+
+            item = candidates[0]
+            metadata = await DownloadableMovieFilesDetail(
+                session=session, item=item
+            ).get_content_model()
+
+            if not metadata.downloads:
+                return {
+                    "stage": "download_metadata",
+                    "result": "no_downloads",
+                    "title": item.title,
+                    "hasResource": metadata.hasResource,
+                    "message": "Search worked, but MovieBox returned no downloadable files.",
+                }
+
+            media = metadata.best_media_file
+            media_url = str(media.url)
+            parsed_media = urlparse(media_url)
+            if parsed_media.scheme != "https" or not parsed_media.hostname:
+                return {
+                    "stage": "url_validation",
+                    "result": "fail",
+                    "title": item.title,
+                    "extension": media.ext,
+                    "message": "Returned media URL was not a valid HTTPS URL.",
+                }
+
+            async with httpx.AsyncClient(
+                follow_redirects=True, timeout=20.0
+            ) as client:
+                async with client.stream(
+                    "GET",
+                    media_url,
+                    headers={
+                        "Range": "bytes=0-63",
+                        "User-Agent": "Mozilla/5.0 MovieBox-download-diagnostic",
+                    },
+                ) as response:
+                    sample = await response.aread()
+                    content_type = response.headers.get(
+                        "content-type", "unknown"
+                    ).split(";")[0].lower()
+                    has_ftyp = len(sample) >= 8 and sample[4:8] == b"ftyp"
+                    is_mp4 = has_ftyp or (
+                        content_type == "video/mp4" and sample[:1] != b"<"
+                    )
+                    return {
+                        "stage": "download_url_check",
+                        "result": (
+                            "pass"
+                            if response.status_code in (200, 206) and is_mp4
+                            else "fail"
+                        ),
+                        "title": item.title,
+                        "extension": media.ext,
+                        "resolution": media.resolution,
+                        "declared_size_bytes": media.size,
+                        "http_status": response.status_code,
+                        "final_host": urlparse(str(response.url)).hostname,
+                        "content_type": content_type,
+                        "sample_bytes": len(sample),
+                        "mp4_ftyp_signature": has_ftyp,
+                        "looks_like_mp4": is_mp4,
+                        "message": (
+                            "A real MP4-like response was received."
+                            if response.status_code in (200, 206) and is_mp4
+                            else "The returned URL did not verify as an MP4 response."
+                        ),
+                    }
+    except Exception as exc:
+        return {
+            "stage": "exception",
+            "result": "error",
+            "error_type": type(exc).__name__,
+            "message": str(exc)[:500],
+        }
+
