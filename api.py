@@ -144,7 +144,7 @@ async def inspect_media(
 
 @app.get("/watch/demo", response_class=HTMLResponse, tags=["playback"])
 async def demo_player():
-    """Browser player for the openly available Big Buck Bunny sample clip."""
+    """Browser player for the openly available Sintel sample clip."""
     video_url = (
         "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/720/"
         "Big_Buck_Bunny_720_10s_1MB.mp4"
@@ -168,7 +168,7 @@ async def demo_player():
 <body>
   <main>
     <h1>Playback test</h1>
-    <p>Big Buck Bunny — a freely available sample clip used to verify browser playback.</p>
+    <p>Sintel — a freely available sample clip used to verify browser playback.</p>
     <video controls playsinline preload="metadata">
       <source src="{video_url}" type="video/mp4">
       Your browser does not support HTML video playback.
@@ -184,7 +184,7 @@ async def demo_player():
 async def diagnose_moviebox_download():
     """
     Tests the repository's real MovieBox search/download functions against the
-    public-domain short film Big Buck Bunny. URLs are deliberately not returned.
+    public-domain short film Sintel. URLs are deliberately not returned.
     """
     import sys
     from pathlib import Path
@@ -200,7 +200,7 @@ async def diagnose_moviebox_download():
 
         session = Session(timeout=20.0)
         async with session._client:
-            search = Search(session=session, query="Big Buck Bunny", per_page=10)
+            search = Search(session=session, query="Sintel", per_page=10)
             results = await search.get_content_model()
 
             candidates = [
@@ -212,7 +212,7 @@ async def diagnose_moviebox_download():
                 return {
                     "stage": "search",
                     "result": "no_match",
-                    "query": "Big Buck Bunny",
+                    "query": "Sintel",
                     "returned_titles": [item.title for item in results.items[:10]],
                     "message": "MovieBox search worked, but returned no matching movie.",
                 }
