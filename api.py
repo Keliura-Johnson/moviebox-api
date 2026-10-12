@@ -10,7 +10,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 DEFAULT_ALLOWED_HOSTS = {"test-videos.co.uk"}
 
 ALLOWED_MEDIA_HOSTS = {
@@ -23,7 +23,7 @@ ALLOWED_MEDIA_HOSTS = {
 
 app = FastAPI(
     title="MovieBox API Web Service",
-    description="MovieBox download API with verified movie and TV episode resolution.",
+    description="MovieBox download API with movie and TV episode resolution.",
     version=APP_VERSION,
 )
 
@@ -46,6 +46,7 @@ async def root():
         "docs": "/docs",
         "media_inspector": "/api/v1/media/inspect",
         "tv_episode_version_diagnostic": "/api/v1/diagnostics/tv-episode-versions",
+        "tv_official_downloader_test": "/api/v1/diagnostics/tv-official-downloader-test",
         "demo_player": "/watch/demo",
     }
 
@@ -321,6 +322,7 @@ async def find_moviebox_v2_series_item(session, title, year=None):
     from moviebox_api.v2.models import SearchResultsItem
 
     clean_title = str(title or "").strip()
+
     if not clean_title:
         raise HTTPException(400, "A title is required.")
 
@@ -387,6 +389,7 @@ async def find_moviebox_v2_series_item(session, title, year=None):
             int(bool(year) and release_date == str(year)),
             int(target in normalized or normalized in target),
         )
+
         candidates.append((score, raw_item))
 
     if not candidates:
@@ -409,7 +412,6 @@ async def find_moviebox_v2_series_item(session, title, year=None):
 async def verify_episode_video_url(
     url, expected_size=None, header_profile="v1_download"
 ):
-    """Inspect a candidate using a documented media-header profile."""
     parsed = urlparse(str(url or ""))
 
     if parsed.scheme != "https" or not parsed.hostname:
@@ -474,7 +476,7 @@ async def verify_episode_video_url(
                         ).split()
                     )[:180]
 
-                    detail = (
+                    return False, (
                         f"http_{status};profile={header_profile};host={final_host};"
                         f"content_type={content_type or 'unknown'};"
                         f"upgrade={upgrade or 'none'};"
@@ -482,8 +484,6 @@ async def verify_episode_video_url(
                         f"content_length={content_length if content_length is not None else 'unknown'};"
                         f"sample={sample or 'empty'}"
                     )
-
-                    return False, detail
 
                 if is_placeholder_resource(str(response.url)):
                     return False, (
@@ -590,7 +590,6 @@ async def verify_episode_video_url(
 async def get_episode_resources(
     session, item, season, episode, checks=None
 ):
-    """Fetch v2 episode resources and verify them before exposing their URLs."""
     from moviebox_api.v2.download import DownloadableTVSeriesFilesDetail
 
     if season < 1 or episode < 1:
@@ -609,16 +608,14 @@ async def get_episode_resources(
 
     if not isinstance(raw_metadata, dict):
         raise HTTPException(
-            502,
-            "MovieBox returned an unexpected episode-resource response.",
+            502, "MovieBox returned an unexpected episode-resource response."
         )
 
     downloads = raw_metadata.get("downloads") or []
 
     if not isinstance(downloads, list):
         raise HTTPException(
-            502,
-            "MovieBox returned an invalid episode downloads list.",
+            502, "MovieBox returned an invalid episode downloads list."
         )
 
     if not downloads and checks is not None:
@@ -649,15 +646,15 @@ async def get_episode_resources(
             continue
 
         try:
-            resolution = int(media_file.get("resolution") or 0)
+            resolution_value = int(media_file.get("resolution") or 0)
             size = int(media_file.get("size") or 0)
         except (TypeError, ValueError):
-            resolution, size = 0, 0
+            resolution_value, size = 0, 0
 
-        if resolution <= 0 or size <= 0:
+        if resolution_value <= 0 or size <= 0:
             if checks is not None:
                 checks.append({
-                    "resolution": resolution or None,
+                    "resolution": resolution_value or None,
                     "reported_size_bytes": size or None,
                     "result": "rejected",
                     "reason": "missing_or_invalid_resolution_or_size",
@@ -665,8 +662,6 @@ async def get_episode_resources(
             continue
 
         if checks is not None:
-            # Compare the documented downloader headers against the v2
-            # metadata client's download headers.
             documented_valid = False
 
             for profile in ("v1_download", "v2_download"):
@@ -675,7 +670,7 @@ async def get_episode_resources(
                 )
 
                 checks.append({
-                    "resolution": resolution,
+                    "resolution": resolution_value,
                     "reported_size_bytes": size,
                     "header_profile": profile,
                     "result": "verified" if valid else "rejected",
@@ -686,7 +681,6 @@ async def get_episode_resources(
                     documented_valid = valid
 
             is_valid = documented_valid
-
         else:
             is_valid, _detail = await verify_episode_video_url(
                 url, size, header_profile="v1_download"
@@ -696,7 +690,7 @@ async def get_episode_resources(
             continue
 
         found.append({
-            "resolution": resolution,
+            "resolution": resolution_value,
             "size": size,
             "resource_link": url,
             "title": f"Episode #{season}.{episode}",
@@ -726,7 +720,6 @@ async def get_episode_resources(
 async def get_verified_tv_episode_v2(
     title, year, season, episode, checks=None
 ):
-    """Resolve an episode through the documented v2 series endpoint."""
     from moviebox_api.v2.requests import Session
 
     session = Session(timeout=30)
@@ -775,7 +768,6 @@ def _title_candidate_score(item, title, year=None):
 
 
 async def collect_v3_tv_episode(title, year, season, episode):
-    """Follow the library's v3 series flow and verify the resulting resources."""
     result = {
         "api_version": "v3",
         "title": str(title),
@@ -856,12 +848,8 @@ async def collect_v3_tv_episode(title, year, season, episode):
                     dub = next(
                         (
                             entry for entry in dubs
-                            if str(
-                                getattr(entry, "lan_name", "")
-                            ).lower() == "original"
-                            or str(
-                                getattr(entry, "lan_code", "")
-                            ).lower() == "original"
+                            if str(getattr(entry, "lan_name", "")).lower() == "original"
+                            or str(getattr(entry, "lan_code", "")).lower() == "original"
                             or bool(getattr(entry, "original", False))
                         ),
                         dubs[0],
@@ -877,7 +865,6 @@ async def collect_v3_tv_episode(title, year, season, episode):
                     or getattr(dub, "lan_code", None)
                     or "selected"
                 )
-
             else:
                 download_subject_id = str(series_item.subject_id)
 
@@ -917,23 +904,18 @@ async def collect_v3_tv_episode(title, year, season, episode):
                             client,
                             page=page,
                             per_page=per_page,
-                            resolution=CustomResolutionType(
-                                f"{quality}P"
-                            ),
+                            resolution=CustomResolutionType(f"{quality}P"),
                         )
 
                         file_details = await request.get_content_model(
                             download_subject_id,
                             release_date=release_date,
                         )
-
                     except Exception as exc:
                         result["checks"].append({
                             "resolution": quality,
                             "result": "request_error",
-                            "reason": (
-                                f"{type(exc).__name__}:{str(exc)[:180]}"
-                            ),
+                            "reason": f"{type(exc).__name__}:{str(exc)[:180]}",
                         })
                         continue
 
@@ -945,35 +927,23 @@ async def collect_v3_tv_episode(title, year, season, episode):
 
                     matched = [
                         entry for entry in entries
-                        if _as_positive_int(
-                            getattr(entry, "season", 0)
-                        ) == int(season)
-                        and _as_positive_int(
-                            getattr(entry, "episode", 0)
-                        ) == int(episode)
+                        if _as_positive_int(getattr(entry, "season", 0)) == int(season)
+                        and _as_positive_int(getattr(entry, "episode", 0)) == int(episode)
                     ]
 
                     if not matched:
                         result["checks"].append({
                             "resolution": quality,
                             "result": "no_episode_record",
-                            "reason": (
-                                "requested_episode_not_in_v3_resource_list"
-                            ),
+                            "reason": "requested_episode_not_in_v3_resource_list",
                         })
                         continue
 
                     for video in matched:
-                        actual_quality = (
-                            get_option_resolution(video) or quality
-                        )
-                        size = _as_positive_int(
-                            getattr(video, "size", 0)
-                        )
+                        actual_quality = get_option_resolution(video) or quality
+                        size = _as_positive_int(getattr(video, "size", 0))
                         duration = getattr(video, "duration", None)
-                        url = str(
-                            getattr(video, "resource_link", "") or ""
-                        )
+                        url = str(getattr(video, "resource_link", "") or "")
 
                         if duration is not None:
                             duration_int = _as_positive_int(duration)
@@ -984,16 +954,12 @@ async def collect_v3_tv_episode(title, year, season, episode):
                                     "reported_size_bytes": size or None,
                                     "duration": duration_int,
                                     "result": "rejected",
-                                    "reason": (
-                                        f"duration_too_short:{duration_int}s"
-                                    ),
+                                    "reason": f"duration_too_short:{duration_int}s",
                                 })
                                 continue
 
                         valid, detail = await verify_episode_video_url(
-                            url,
-                            size,
-                            header_profile="v1_download",
+                            url, size, header_profile="v1_download"
                         )
 
                         actual_size = None
@@ -1001,8 +967,7 @@ async def collect_v3_tv_episode(title, year, season, episode):
                         if detail and "size_mismatch:" in detail:
                             try:
                                 actual_size = int(
-                                    detail.split("actual=", 1)[1]
-                                    .split(";", 1)[0]
+                                    detail.split("actual=", 1)[1].split(";", 1)[0]
                                 )
                             except (IndexError, ValueError):
                                 pass
@@ -1032,17 +997,12 @@ async def collect_v3_tv_episode(title, year, season, episode):
                             })
 
     except Exception as exc:
-        result["error"] = (
-            f"{type(exc).__name__}: {str(exc)[:300]}"
-        )
+        result["error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
 
     unique = {}
 
     for resource in result["resources"]:
-        unique[(
-            resource["resolution"],
-            resource["resource_link"],
-        )] = resource
+        unique[(resource["resolution"], resource["resource_link"])] = resource
 
     result["resources"] = sorted(
         unique.values(),
@@ -1062,26 +1022,21 @@ async def get_verified_tv_episode(
     v2_checks = [] if diagnostic else None
 
     try:
-        v2 = await get_verified_tv_episode_v2(
-            title,
-            year,
-            season,
-            episode,
-            checks=v2_checks,
+        v2_result = await get_verified_tv_episode_v2(
+            title, year, season, episode, checks=v2_checks
         )
 
         v2 = {
             "api_version": "v2",
-            "title": v2.get("title", title),
-            "subject_id": v2.get("subject_id"),
+            "title": v2_result.get("title", title),
+            "subject_id": v2_result.get("subject_id"),
             "resources": [
                 {**resource, "api_version": "v2"}
-                for resource in v2.get("resources", [])
+                for resource in v2_result.get("resources", [])
             ],
             "checks": v2_checks or [],
             "error": None,
         }
-
     except Exception as exc:
         v2 = {
             "api_version": "v2",
@@ -1089,24 +1044,16 @@ async def get_verified_tv_episode(
             "subject_id": None,
             "resources": [],
             "checks": v2_checks or [],
-            "error": (
-                f"{type(exc).__name__}: {str(exc)[:300]}"
-            ),
+            "error": f"{type(exc).__name__}: {str(exc)[:300]}",
         }
 
     combined = {}
 
     for version in (v3, v2):
         for resource in version.get("resources", []):
-            key = (
-                resource["resolution"],
-                resource["resource_link"],
-            )
+            key = (resource["resolution"], resource["resource_link"])
 
-            if (
-                key not in combined
-                or resource.get("api_version") == "v3"
-            ):
+            if key not in combined or resource.get("api_version") == "v3":
                 combined[key] = resource
 
     resources = sorted(
@@ -1118,10 +1065,7 @@ async def get_verified_tv_episode(
     )
 
     selected = next(
-        (
-            version for version in (v3, v2)
-            if version.get("resources")
-        ),
+        (version for version in (v3, v2) if version.get("resources")),
         v3,
     )
 
@@ -1136,8 +1080,8 @@ async def get_verified_tv_episode(
                 "download_subject_id": v3.get("download_subject_id"),
                 "dub": v3.get("dub"),
                 "verified_qualities": sorted({
-                    entry["resolution"]
-                    for entry in v3.get("resources", [])
+                    item["resolution"]
+                    for item in v3.get("resources", [])
                 }),
                 "checks": v3.get("checks", []),
                 "error": v3.get("error"),
@@ -1146,8 +1090,8 @@ async def get_verified_tv_episode(
                 "title": v2.get("title"),
                 "subject_id": v2.get("subject_id"),
                 "verified_qualities": sorted({
-                    entry["resolution"]
-                    for entry in v2.get("resources", [])
+                    item["resolution"]
+                    for item in v2.get("resources", [])
                 }),
                 "checks": v2.get("checks", []),
                 "error": v2.get("error"),
@@ -1173,7 +1117,6 @@ async def get_download_qualities(
             )
 
             resources = episode_data["resources"]
-
             qualities = sorted({
                 resource["resolution"]
                 for resource in resources
@@ -1200,7 +1143,6 @@ async def get_download_qualities(
                 "qualities": qualities,
             }
 
-        # Existing movie quality-selection logic is preserved.
         from moviebox_api.v3.http_client import MovieBoxHttpClient
         from moviebox_api.v3.core import ItemDetails
 
@@ -1237,7 +1179,6 @@ async def get_download_qualities(
 
     except HTTPException:
         raise
-
     except Exception as exc:
         raise HTTPException(
             502,
@@ -1280,15 +1221,9 @@ async def resolve_download(
             ]
 
             chosen = (
-                max(
-                    eligible,
-                    key=lambda resource: resource["resolution"],
-                )
+                max(eligible, key=lambda resource: resource["resolution"])
                 if eligible
-                else min(
-                    resources,
-                    key=lambda resource: resource["resolution"],
-                )
+                else min(resources, key=lambda resource: resource["resolution"])
             )
 
             return {
@@ -1299,7 +1234,6 @@ async def resolve_download(
                 "season": season,
                 "episode": episode,
                 "resolution": chosen["resolution"],
-                "api_version": chosen.get("api_version"),
                 "size_bytes": chosen["size"],
                 "download_url": chosen["resource_link"],
                 "url_expires_note": (
@@ -1308,7 +1242,6 @@ async def resolve_download(
                 ),
             }
 
-        # Existing movie-resolution logic is preserved.
         from moviebox_api.v3.http_client import MovieBoxHttpClient
         from moviebox_api.v3.core import ItemDetails
 
@@ -1363,12 +1296,275 @@ async def resolve_download(
 
     except HTTPException:
         raise
-
     except Exception as exc:
         raise HTTPException(
             502,
             f"MovieBox download resolution failed ({type(exc).__name__}): {str(exc)[:900]}",
         ) from exc
+
+
+@app.get("/api/v1/diagnostics/tv-official-downloader-test")
+async def diagnose_tv_official_downloader_test(
+    title: str = Query(..., min_length=1, max_length=200),
+    year: int | None = Query(default=None, ge=1888, le=2100),
+    season: int = Query(default=1, ge=1, le=100),
+    episode: int = Query(default=1, ge=1, le=1000),
+    resolution: int = Query(default=360, ge=144, le=2160),
+):
+    """Test one V2 episode resource through the library's own downloader."""
+    setup_source_path()
+
+    try:
+        from moviebox_api.v2.requests import Session
+        from moviebox_api.v2.download import (
+            DownloadableTVSeriesFilesDetail,
+            MediaFileDownloader,
+        )
+        from moviebox_api.v1.models import MediaFileMetadata
+
+        session = Session(timeout=30)
+
+        async with session._client:
+            item = await find_moviebox_v2_series_item(
+                session, title, year
+            )
+
+            raw = await DownloadableTVSeriesFilesDetail(
+                session=session,
+                item=item,
+            ).get_content(int(season), int(episode))
+
+            downloads = (
+                raw.get("downloads", [])
+                if isinstance(raw, dict)
+                else []
+            )
+
+            candidates = []
+
+            for entry in downloads if isinstance(downloads, list) else []:
+                if not isinstance(entry, dict):
+                    continue
+
+                url = str(
+                    entry.get("url")
+                    or entry.get("resource_link")
+                    or entry.get("resourceLink")
+                    or ""
+                ).strip()
+
+                if not url:
+                    continue
+
+                try:
+                    item_resolution = int(entry.get("resolution") or 0)
+                    item_size = int(entry.get("size") or 0)
+                except (TypeError, ValueError):
+                    continue
+
+                if item_resolution <= 0 or item_size <= 0:
+                    continue
+
+                candidates.append({
+                    "id": str(entry.get("id") or "diagnostic"),
+                    "url": url,
+                    "resolution": item_resolution,
+                    "size": item_size,
+                })
+
+            if not candidates:
+                return {
+                    "result": "no_candidates",
+                    "stage": "v2_episode_resource_lookup",
+                    "title": str(getattr(item, "title", None) or title),
+                    "subject_id": str(getattr(item, "subjectId", "") or ""),
+                    "season": season,
+                    "episode": episode,
+                    "reported_qualities": [],
+                    "message": (
+                        "The documented V2 episode endpoint returned no usable "
+                        "URL, quality and size records."
+                    ),
+                }
+
+            candidate_qualities = sorted({
+                entry["resolution"] for entry in candidates
+            })
+
+            eligible = [
+                entry for entry in candidates
+                if entry["resolution"] <= resolution
+            ]
+
+            chosen = (
+                max(eligible, key=lambda entry: entry["resolution"])
+                if eligible
+                else min(candidates, key=lambda entry: entry["resolution"])
+            )
+
+            if is_placeholder_resource(chosen["url"]):
+                return {
+                    "result": "rejected_known_placeholder_before_request",
+                    "stage": "v2_episode_resource_lookup",
+                    "title": str(getattr(item, "title", None) or title),
+                    "subject_id": str(getattr(item, "subjectId", "") or ""),
+                    "season": season,
+                    "episode": episode,
+                    "requested_resolution": resolution,
+                    "selected_resolution": chosen["resolution"],
+                    "reported_size_bytes": chosen["size"],
+                    "qualities_returned": candidate_qualities,
+                    "message": (
+                        "The selected URL matches the known placeholder path. "
+                        "No media request was made."
+                    ),
+                }
+
+            media_file = MediaFileMetadata.model_construct(
+                id=chosen["id"],
+                url=chosen["url"],
+                resolution=chosen["resolution"],
+                size=chosen["size"],
+            )
+
+            official_downloader = MediaFileDownloader(
+                tasks=1,
+                timeout=httpx.Timeout(
+                    connect=15, read=20, write=15, pool=15
+                ),
+                follow_redirects=True,
+            )
+
+            started = time.monotonic()
+
+            response = await official_downloader.run(
+                media_file=media_file,
+                filename=(
+                    f"official-test-S{season}E{episode}-"
+                    f"{chosen['resolution']}p.mp4"
+                ),
+                test=True,
+                disable_progress_bar=True,
+            )
+
+            elapsed = round(time.monotonic() - started, 2)
+
+            if not isinstance(response, httpx.Response):
+                return {
+                    "result": "unexpected_test_result_type",
+                    "stage": "official_media_file_downloader",
+                    "result_type": type(response).__name__,
+                    "title": str(getattr(item, "title", None) or title),
+                    "season": season,
+                    "episode": episode,
+                    "selected_resolution": chosen["resolution"],
+                    "reported_size_bytes": chosen["size"],
+                    "elapsed_seconds": elapsed,
+                    "message": (
+                        "The library test method did not return an HTTP response "
+                        "object; this is not considered a successful download."
+                    ),
+                }
+
+            final_url = str(response.url)
+            final_parsed = urlparse(final_url)
+            headers = response.headers
+            status = response.status_code
+            content_type = headers.get(
+                "content-type", ""
+            ).split(";")[0].lower()
+
+            content_range = headers.get("content-range")
+            content_length_text = headers.get("content-length")
+            content_length = (
+                int(content_length_text)
+                if content_length_text and content_length_text.isdigit()
+                else None
+            )
+
+            etag = headers.get("etag")
+            accept_ranges = headers.get("accept-ranges")
+            upgrade = headers.get("upgrade")
+
+            total_from_range = None
+
+            if content_range and "/" in content_range:
+                range_total = content_range.rsplit("/", 1)[-1].strip()
+
+                if range_total.isdigit():
+                    total_from_range = int(range_total)
+
+            reported = chosen["size"]
+            actual_header_size = total_from_range
+
+            if actual_header_size is None and status == 200:
+                actual_header_size = content_length
+
+            size_matches = (
+                None
+                if actual_header_size is None
+                else actual_header_size == reported
+            )
+
+            final_is_placeholder = is_placeholder_resource(final_url)
+            looks_like_html = content_type in {
+                "text/html", "application/json", "text/plain"
+            }
+
+            if final_is_placeholder:
+                result = "rejected_placeholder_redirect"
+            elif status not in (200, 206):
+                result = "official_downloader_request_rejected"
+            elif looks_like_html:
+                result = "rejected_non_video_content_type"
+            elif size_matches is False:
+                result = "rejected_size_mismatch"
+            else:
+                result = "request_accepted_needs_full_file_confirmation"
+
+            payload = {
+                "result": result,
+                "stage": "official_media_file_downloader_test_mode",
+                "title": str(getattr(item, "title", None) or title),
+                "subject_id": str(getattr(item, "subjectId", "") or ""),
+                "season": season,
+                "episode": episode,
+                "selected_resolution": chosen["resolution"],
+                "reported_size_bytes": reported,
+                "http_status": status,
+                "final_host": final_parsed.hostname,
+                "final_path": final_parsed.path,
+                "content_type": content_type or "unknown",
+                "content_length_header": content_length,
+                "content_range_header": content_range,
+                "actual_size_from_headers": actual_header_size,
+                "header_size_matches_metadata": size_matches,
+                "accept_ranges": accept_ranges,
+                "etag_present": bool(etag),
+                "upgrade_header": upgrade,
+                "redirect_count": len(response.history),
+                "elapsed_seconds": elapsed,
+                "test_mode": True,
+                "qualities_returned": candidate_qualities,
+                "warning": (
+                    "test=True checks request/download viability without saving "
+                    "the full file. A successful response alone does not prove "
+                    "the URL contains the complete requested episode."
+                ),
+            }
+
+            await response.aclose()
+            return payload
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        return {
+            "result": "error",
+            "stage": "official_media_file_downloader_test_mode",
+            "error_type": type(exc).__name__,
+            "message": str(exc)[:500],
+        }
 
 
 @app.get("/api/v1/diagnostics/tv-episode-versions")
@@ -1378,7 +1574,6 @@ async def diagnose_tv_episode_versions(
     season: int = Query(default=1, ge=1, le=100),
     episode: int = Query(default=1, ge=1, le=1000),
 ):
-    """Compare V2 and V3 series lookup with detailed media-response diagnostics."""
     setup_source_path()
 
     data = await get_verified_tv_episode(
@@ -1395,37 +1590,30 @@ async def diagnose_tv_episode_versions(
     v2_profiles_that_passed = sorted({
         check.get("header_profile")
         for check in versions["v2"].get("checks", [])
-        if (
-            check.get("result") == "verified"
-            and check.get("header_profile")
-        )
+        if check.get("result") == "verified"
+        and check.get("header_profile")
     })
 
     return {
-        "result": (
-            "verified_episode_found"
-            if found
-            else "no_verified_episode"
-        ),
+        "result": "verified_episode_found" if found else "no_verified_episode",
         "title": data["title"],
         "season": season,
         "episode": episode,
         "versions_with_verified_resources": found,
-        "v2_header_profiles_that_passed_media_verification": (
-            v2_profiles_that_passed
-        ),
+        "v2_header_profiles_that_passed_media_verification": v2_profiles_that_passed,
         "note": (
             "A header profile passing the small media probe is not by itself "
-            "proof that the entire episode downloads. The normal resolver "
-            "trusts the documented v1 MediaFileDownloader headers."
+            "proof that the entire episode downloads; the official-downloader "
+            "test endpoint checks the library's own request method."
         ),
         "versions": versions,
         "next_step": (
             "The listed version returned a verified episode resource."
             if found
             else (
-                "No candidate passed using the documented downloader profile. "
-                "Compare the two V2 header profiles and their HTTP response details."
+                "No candidate passed using the current verification profile. "
+                "Use /api/v1/diagnostics/tv-official-downloader-test to test "
+                "one V2 resource through the library's downloader."
             )
         ),
     }
@@ -1462,8 +1650,7 @@ async def diagnose_moviebox_download():
             item = candidates[0]
 
             raw = await DownloadableMovieFilesDetail(
-                session=session,
-                item=item,
+                session=session, item=item
             ).get_content()
 
             downloads = [
@@ -1480,8 +1667,7 @@ async def diagnose_moviebox_download():
             checks = []
 
             async with httpx.AsyncClient(
-                follow_redirects=True,
-                timeout=20,
+                follow_redirects=True, timeout=20
             ) as client:
                 for media in metadata.downloads:
                     try:
@@ -1494,10 +1680,8 @@ async def diagnose_moviebox_download():
                             },
                         ) as response:
                             sample = await response.aread()
-
                             has_ftyp = (
-                                len(sample) >= 8
-                                and sample[4:8] == b"ftyp"
+                                len(sample) >= 8 and sample[4:8] == b"ftyp"
                             )
 
                             checks.append({
@@ -1562,8 +1746,7 @@ async def diagnose_moviebox_v3_download():
             checks = []
 
             async with httpx.AsyncClient(
-                follow_redirects=True,
-                timeout=25,
+                follow_redirects=True, timeout=25
             ) as media_client:
                 for option in get_movie_options(details):
                     url = str(option.resource_link)
