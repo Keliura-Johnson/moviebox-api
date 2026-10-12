@@ -1058,6 +1058,16 @@ async def get_tv_episode_candidates_v2(title, year, season, episode):
             session, title, year
         )
 
+        # Episode URLs can be signed and may become stale when the
+        # metadata response is reused from cache. The upstream-cache
+        # diagnostic showed different URL fingerprints for ordinary and
+        # no-cache requests, so request fresh episode metadata here.
+        session._headers = {
+            **dict(session._headers or {}),
+            "Cache-Control": "no-cache, max-age=0",
+            "Pragma": "no-cache",
+        }
+
         raw = await DownloadableTVSeriesFilesDetail(
             session=session,
             item=item,
