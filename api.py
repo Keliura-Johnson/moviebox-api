@@ -1593,9 +1593,9 @@ async def resolve_download(
                 try:
                     from moviebox_api.v3.http_client import MovieBoxHttpClient
 
-                    async with MovieBoxHttpClient(timeout=30) as client:
+                    async with MovieBoxHttpClient(timeout=30) as subtitle_client:
                         subtitle_url = await get_english_subtitle_url(
-                            client,
+                            subtitle_client,
                             download_subject_id,
                             resource_id,
                         )
@@ -1667,7 +1667,9 @@ async def resolve_download(
 
             subtitle_url = None
             resource_id = str(
-                getattr(chosen, "resource_id", None) or ""
+                getattr(chosen, "resource_id", None)
+                or getattr(chosen, "id", None)
+                or ""
             )
 
             if resource_id:
