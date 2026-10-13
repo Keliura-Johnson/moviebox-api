@@ -1345,11 +1345,6 @@ async def collect_v3_tv_episode(title, year, season, episode):
                                 "resolution": actual_quality,
                                 "size": size,
                                 "resource_link": url,
-                                "resource_id": str(
-                                    getattr(video, "resource_id", None)
-                                    or getattr(video, "id", None)
-                                    or ""
-                                ),
                                 "title": str(
                                     getattr(video, "title", None)
                                     or f"Episode #{season}.{episode}"
@@ -1581,27 +1576,6 @@ async def resolve_download(
                 else min(resources, key=lambda entry: entry["resolution"])
             )
 
-            subtitle_url = None
-            download_subject_id = (
-                data.get("versions", {})
-                .get("v3", {})
-                .get("download_subject_id")
-            )
-            resource_id = chosen.get("resource_id")
-
-            if download_subject_id and resource_id:
-                try:
-                    from moviebox_api.v3.http_client import MovieBoxHttpClient
-
-                    async with MovieBoxHttpClient(timeout=30) as client:
-                        subtitle_url = await get_english_subtitle_url(
-                            client,
-                            download_subject_id,
-                            resource_id,
-                        )
-                except Exception:
-                    subtitle_url = None
-
             return {
                 "result": "ok",
                 "title": chosen["title"],
@@ -1626,7 +1600,6 @@ async def resolve_download(
                         "not yet confirmed."
                     )
                 ),
-                "subtitle_url": subtitle_url,
             }
 
         from moviebox_api.v3.http_client import MovieBoxHttpClient
@@ -1665,21 +1638,6 @@ async def resolve_download(
                     502, "MovieBox returned an invalid download URL."
                 )
 
-            subtitle_url = None
-            resource_id = str(
-                getattr(chosen, "resource_id", None) or ""
-            )
-
-            if resource_id:
-                try:
-                    subtitle_url = await get_english_subtitle_url(
-                        client,
-                        str(item.subject_id),
-                        resource_id,
-                    )
-                except Exception:
-                    subtitle_url = None
-
             return {
                 "result": "ok",
                 "title": str(
@@ -1693,7 +1651,6 @@ async def resolve_download(
                 "url_expires_note": (
                     "Start downloading promptly; the source URL may expire."
                 ),
-                "subtitle_url": subtitle_url,
             }
 
     except HTTPException:
