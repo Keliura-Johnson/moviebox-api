@@ -105,7 +105,31 @@ async def inspect_media(url: str = Query(..., max_length=2048)):
         raise HTTPException(
             502, f"Media host request failed: {type(exc).__name__}"
         ) from exc
+async def get_english_subtitle_url(client, subject_id, resource_id):
+    try:
+        from moviebox_api.v3.core import DownloadableCaptionFileDetails
 
+        captions = await DownloadableCaptionFileDetails(
+            client_session=client
+        ).get_content_model(
+            str(subject_id),
+            str(resource_id),
+        )
+
+        english = captions.english_subtitle_file
+
+        if not english:
+            return None
+
+        url = str(english.url)
+
+        if not url.startswith("https://"):
+            return None
+
+        return url
+
+    except Exception:
+        return None
 
 @app.get("/watch/demo", response_class=HTMLResponse)
 async def demo_player():
