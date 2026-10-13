@@ -1602,21 +1602,6 @@ async def resolve_download(
                 except Exception:
                     subtitle_url = None
 
-            subtitle_url = None
-            resource_id = str(
-                getattr(chosen, "resource_id", None) or ""
-            )
-
-            if resource_id:
-                try:
-                    subtitle_url = await get_english_subtitle_url(
-                        client,
-                        str(item.subject_id),
-                        resource_id,
-                    )
-                except Exception:
-                    subtitle_url = None
-
             return {
                 "result": "ok",
                 "title": chosen["title"],
@@ -1679,6 +1664,21 @@ async def resolve_download(
                 raise HTTPException(
                     502, "MovieBox returned an invalid download URL."
                 )
+
+            subtitle_url = None
+            resource_id = str(
+                getattr(chosen, "resource_id", None) or ""
+            )
+
+            if resource_id:
+                try:
+                    subtitle_url = await get_english_subtitle_url(
+                        client,
+                        str(item.subject_id),
+                        resource_id,
+                    )
+                except Exception:
+                    subtitle_url = None
 
             return {
                 "result": "ok",
